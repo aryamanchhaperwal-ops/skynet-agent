@@ -1,0 +1,102 @@
+# ---------------------------------------------------------------------------
+# SKYNET - global intelligence and early-warning platform
+#
+# Single distribution that exposes four importable top-level packages:
+#
+#   database      - persistence layer: engines, ORM models, repositories, migrations
+#   connectors    - pluggable external data-source connectors + ingestion pipeline
+#   intelligence  - anomaly detection, correlation, provenance, AI, forecasting,
+#                   self-improvement
+#   backend       - FastAPI application, routers, request/response schemas
+#
+# Dependency direction is strictly one-way:
+#
+#   database  <--  connectors  <--  backend
+#             <--  intelligence <--  backend
+#
+# Nothing in `database` may import from `connectors`, `intelligence` or `backend`.
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skynet"
+version = "0.1.0"
+description = "SKYNET - global intelligence and early-warning platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.6.0",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "asyncpg>=0.30.0",
+  "geoalchemy2>=0.16.0",
+  "alembic>=1.14.0",
+  "httpx>=0.27.2",
+  "tenacity>=9.0.0",
+  "feedparser>=6.0.11",
+  "python-dateutil>=2.9.0",
+  "orjson>=3.10.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+  "pytest-asyncio>=0.24.0",
+  "pytest-cov>=6.0.0",
+  "respx>=0.21.1",
+  "ruff>=0.7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "backend*",
+  "connectors*",
+  "intelligence*",
+  "database*",
+]
+exclude = [
+  "tests*",
+  "frontend*",
+  "docs*",
+  "database.migrations*",
+]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+  "ignore::DeprecationWarning:feedparser.*",
+]
+markers = [
+  "db: test requires a live PostgreSQL/PostGIS database (auto-skipped when unavailable)",
+  "network: test reaches a real external data source (auto-skipped when offline)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = [
+  "B008",   # FastAPI Depends() in argument defaults is idiomatic
+  "RUF001", # ambiguous unicode characters in prose/docstrings
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"database/migrations/*" = ["E501", "I001"]
+"tests/*" = ["E501"]

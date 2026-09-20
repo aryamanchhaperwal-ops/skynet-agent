@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# SKYNET local infrastructure
+#
+# Only infrastructure lives here. The frontend and backend run on the host so
+# that hot-reload, native debugging and Cesium static-asset serving stay simple.
+#
+#   docker compose up -d
+#
+# PostGIS is exposed on host port 5433 (not 5432) to avoid colliding with any
+# locally installed PostgreSQL instance.
+# ---------------------------------------------------------------------------
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: skynet-postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: skynet
+      POSTGRES_PASSWORD: skynet_local_dev
+      POSTGRES_DB: skynet
+      # Deterministic collation keeps ordering stable across machines.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5433:5432"
+    volumes:
+      - skynet-pgdata:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skynet -d skynet"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  skynet-pgdata:

@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# SKYNET - secrets and environment
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Node / Next.js
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+build/
+dist/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+.eslintcache
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Cesium static assets copied into the frontend's public folder at build time.
+# They are regenerated from node_modules by `npm run cesium:assets`.
+frontend/public/cesium/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+.eggs/
+
+# ---------------------------------------------------------------------------
+# Local runtime artefacts
+# ---------------------------------------------------------------------------
+.freebuff/
+/data/
+/logs/
+*.log
+/tmp/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
