@@ -8,6 +8,7 @@
 #   intelligence  - anomaly detection, correlation, provenance, AI, forecasting,
 #                   self-improvement
 #   backend       - FastAPI application, routers, request/response schemas
+#   agency        - Skynet core: goals, planner, actions, experience, the agent loop
 #
 # Dependency direction is strictly one-way:
 #
@@ -53,6 +54,10 @@ dev = [
   "ruff>=0.7.0",
 ]
 
+[project.scripts]
+# Available after `pip install -e .`; until then use `python -m agency.cli`.
+skynet = "agency.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
@@ -60,6 +65,7 @@ include = [
   "connectors*",
   "intelligence*",
   "database*",
+  "agency*",
 ]
 exclude = [
   "tests*",
@@ -75,7 +81,10 @@ exclude = [
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
+# Session-scoped loop: the process-wide asyncpg engine must never see two
+# different event loops (connections are bound to the loop that made them).
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 filterwarnings = [
   "ignore::DeprecationWarning:feedparser.*",
 ]
@@ -100,3 +109,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "database/migrations/*" = ["E501", "I001"]
 "tests/*" = ["E501"]
+# SQLAlchemy's DeclarativeBase requires type_annotation_map as a plain class
+# attribute (upstream pattern); RUF012 is a false positive here.
+"database/base.py" = ["RUF012"]

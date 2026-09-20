@@ -144,6 +144,6 @@ async def database_health() -> dict[str, object]:
                 if row["server_time"]
                 else None,
             }
-    except Exception as exc:  # noqa: BLE001 - health must never propagate
+    except Exception as exc:
         logger.warning("Database health probe failed: %s", exc)
         return {"reachable": False, "error": str(exc)}
