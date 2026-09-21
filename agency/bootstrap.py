@@ -36,7 +36,19 @@ from agency.experience import (
     InMemoryExperienceSink,
 )
 from agency.goals import GoalManager
+from agency.intelligence import (
+    IntelligenceService,
+    LLMPlanner,
+    build_llm_provider,
+)
 from agency.loop import SkynetCore
+from agency.memory import MemoryManager
+from agency.memory.actions import (
+    MemoryExtractAction,
+    MemorySearchAction,
+    MemoryStoreAction,
+)
+from agency.memory.stores import build_memory_store
 from agency.perception import build_perception_adapter
 from agency.planner import DeterministicPlanner, Planner
 from agency.storage import DatabaseStorage, MemoryStorage, Storage
@@ -83,6 +95,12 @@ class WebStack(NamedTuple):
     provider: SearchProvider
     fetcher: SafeFetcher
     service: ResearchService
+
+
+class MemoryStack(NamedTuple):
+    """The long-term memory pieces, exposed for wiring and testing."""
+
+    manager: MemoryManager
 
 
 class CommsStack(NamedTuple):
@@ -154,6 +172,52 @@ def build_comms_stack(
     return CommsStack(registry=registry, manager=manager, comparison=comparison)
 
 
+def build_intelligence_service(settings: SkynetSettings) -> IntelligenceService:
+    """Build the intelligence provider/service from settings.
+
+    ``openai`` denotes any OpenAI-compatible endpoint (OpenAI, Ollama via
+    SKYNET_LLM_BASE_URL, vLLM, OpenRouter…). Credentials are read from the
+    environment at call time — never from settings or code. The factory
+    raises loudly on missing credentials rather than silently degrading.
+    """
+    from agency.intelligence.service import IntelligenceService
+
+    provider = build_llm_provider(
+        settings.llm_provider,
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
+    )
+    return IntelligenceService(
+        provider,
+        model=settings.llm_model,
+        temperature=settings.llm_temperature,
+        max_tokens=settings.llm_max_tokens,
+        timeout=settings.llm_timeout_seconds,
+        max_retries=settings.llm_max_retries,
+    )
+
+
+def build_memory_stack(settings: SkynetSettings) -> MemoryStack:
+    """Assemble the long-term memory stack from settings."""
+    store = build_memory_store(
+        settings.memory_backend, sqlite_path=settings.memory_sqlite_path
+    )
+    manager = MemoryManager(
+        store,
+        importance_threshold=settings.memory_importance_threshold,
+        max_results=settings.memory_max_results,
+        recall_max_chars=settings.memory_recall_max_chars,
+    )
+    return MemoryStack(manager=manager)
+
+
+def build_llm_evaluator(service: IntelligenceService) -> Evaluator:
+    """Build the LLM-backed evaluator (kept separate for test injection)."""
+    from agency.intelligence.evaluator import LLMEvaluator
+
+    return LLMEvaluator(service)
+
+
 def build_core(
     settings: SkynetSettings | None = None,
     *,
@@ -164,6 +228,7 @@ def build_core(
     experience_sink: ExperienceSink | None = None,
     extra_actions: tuple[Action, ...] = (),
     extra_trace_sinks: tuple[TraceSink, ...] = (),
+    memory: MemoryManager | None = None,
 ) -> SkynetCore:
     """Assemble a SkynetCore from settings.
 
@@ -222,9 +287,39 @@ def build_core(
     session_for_perception = session_factory if database_enabled else None
     perception = build_perception_adapter(settings.perception_adapter, session_for_perception)
 
-    # -- Strategies ---------------------------------------------------------------
-    planner = planner or DeterministicPlanner()
-    evaluator = evaluator or DeterministicEvaluator()
+    # -- Long-term memory (always assembled; backend from settings) -------------
+    memory = memory or build_memory_stack(settings).manager
+    register_action(registry, MemoryStoreAction(memory), settings)
+    register_action(registry, MemorySearchAction(memory), settings)
+    register_action(registry, MemoryExtractAction(memory), settings)
+
+    # -- Intelligence + strategies ------------------------------------------------
+    use_llm_planner = planner is None and settings.planner_strategy == "llm"
+    use_llm_evaluator = evaluator is None and settings.evaluator_strategy == "llm"
+    service: IntelligenceService | None = None
+    if use_llm_planner or use_llm_evaluator:
+        try:
+            service = build_intelligence_service(settings)
+        except Exception:
+            # Missing credentials etc. — deterministic strategies keep the
+            # core working (LLM failure must not destroy the core).
+            service = None
+    if planner is None:
+        deterministic_planner = DeterministicPlanner()
+        planner = (
+            LLMPlanner(
+                service,  # type: ignore[arg-type] - guarded by use_llm_planner
+                fallback=deterministic_planner,
+                allowed_actions=frozenset(registry.names()),
+                max_steps=settings.max_steps_per_run,
+            )
+            if service is not None
+            else deterministic_planner
+        )
+    if evaluator is None:
+        evaluator = (
+            build_llm_evaluator(service) if service is not None else DeterministicEvaluator()
+        )
 
     # -- Experience + trace sinks ---------------------------------------------------
     if experience_sink is None:
@@ -247,4 +342,5 @@ def build_core(
         perception=perception,
         experiences=ExperienceRecorder(experience_sink),
         trace_sinks=trace_sinks,
+        memory=memory,
     )

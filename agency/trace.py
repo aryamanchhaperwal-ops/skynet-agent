@@ -65,6 +65,11 @@ class TraceEventType(StrEnum):
     AI_RESPONSE_ANALYZED = "AI_RESPONSE_ANALYZED"
     AI_CONVERSATION_COMPLETED = "AI_CONVERSATION_COMPLETED"
     AI_CONVERSATION_FAILED = "AI_CONVERSATION_FAILED"
+    # -- Intelligence + long-term memory (Phase P2) ----------------------------
+    # Memory events share the run's event stream; payloads carry ids and
+    # counts, never full memory bodies (those live in the memory store).
+    MEMORY_RECALLED = "MEMORY_RECALLED"
+    MEMORY_STORED = "MEMORY_STORED"
 
 
 class TraceEvent(BaseModel):

@@ -41,6 +41,7 @@ from agency.config import SkynetSettings
 from agency.evaluator import Evaluation, Evaluator
 from agency.experience import ExperienceRecorder
 from agency.goals import Goal, GoalManager, GoalSpec
+from agency.memory import MemoryManager
 from agency.observation import Observation
 from agency.perception import PerceptionAdapter
 from agency.planner import Plan, Planner
@@ -115,6 +116,7 @@ class SkynetCore:
         perception: PerceptionAdapter,
         experiences: ExperienceRecorder,
         trace_sinks: Sequence[TraceSink],
+        memory: MemoryManager | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
@@ -125,6 +127,9 @@ class SkynetCore:
         self._perception = perception
         self._experiences = experiences
         self._trace_sinks = list(trace_sinks)
+        #: Optional long-term memory (Phase P2). ``None`` keeps the core
+        #: memory-free (older tests, minimal deployments).
+        self._memory = memory
 
     # ------------------------------------------------------------------ API
 
@@ -165,6 +170,32 @@ class SkynetCore:
             await tracer.emit(TraceEventType.RUN_STARTED, goal_title=spec.title)
             await tracer.emit(TraceEventType.GOAL_CREATED, goal_id=goal.id, title=goal.title)
 
+            # MEMORY RECALL (Phase P2) ----------------------------------------
+            # Relevant memories are injected into state.context for the
+            # planner/evaluator to see — a bounded, budgeted slice, never the
+            # whole store. A broken or absent memory manager is not an error:
+            # the run simply plans without recall.
+            if self._memory is not None:
+                try:
+                    recalled = await self._memory.recall(spec.title)
+                    if recalled:
+                        state.context["memory_recall"] = [
+                            {
+                                "id": m.id,
+                                "type": m.type.value,
+                                "summary": m.summary or m.content[:120],
+                                "source": m.source,
+                            }
+                            for m in recalled
+                        ]
+                        await tracer.emit(
+                            TraceEventType.MEMORY_RECALLED,
+                            count=len(recalled),
+                            memory_ids=[m.id for m in recalled],
+                        )
+                except Exception:
+                    logger.exception("Skynet run %s: memory recall failed (ignored)", run_id)
+
             # OBSERVE ---------------------------------------------------------
             try:
                 observations = await self._perception.observe(state)
@@ -186,7 +217,14 @@ class SkynetCore:
                     goal_id=goal.id,
                     kind="observation",
                     summary=observation.summary or observation.source,
-                    payload=observation.model_dump(mode="json"),
+                    payload={
+                        "observation": observation.model_dump(mode="json"),
+                        # Machine-readable slot for downstream memory
+                        # extraction (Phase P2): observations enter memory
+                        # with their provenance intact.
+                        "skynet_observations": [observation.model_dump(mode="json")],
+                        "source_action": "perception",
+                    },
                     outcome="failure" if observation.kind == "error" else "neutral",
                 )
                 if observation.kind == "error":

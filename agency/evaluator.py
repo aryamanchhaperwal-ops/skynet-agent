@@ -20,13 +20,21 @@ EvaluationLevel = Literal["action", "run"]
 
 
 class Evaluation(BaseModel):
-    """Verdict about one action or one whole run."""
+    """Verdict about one action or one whole run.
+
+    ``source`` records *who* judged: ``deterministic`` (structural policy)
+    or ``llm`` (model judgment — recorded, never treated as objective
+    truth). ``confidence`` is the judge's self-reported confidence when it
+    provides one.
+    """
 
     subject: str
     level: EvaluationLevel
     score: float = Field(ge=0.0, le=1.0)
     passed: bool
     notes: str = ""
+    source: Literal["deterministic", "llm"] = "deterministic"
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class Evaluator(ABC):

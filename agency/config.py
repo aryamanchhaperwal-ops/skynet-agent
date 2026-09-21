@@ -41,10 +41,11 @@ class SkynetSettings(BaseSettings):
         description="'database' persists goals/runs/events/experiences in PostgreSQL; "
         "'memory' keeps everything in-process (tests, dry runs).",
     )
-    default_provider: Literal["deterministic", "anthropic", "openai"] = Field(
+    default_provider: Literal["deterministic", "llm"] = Field(
         default="deterministic",
-        description="Reasoning provider selection. Only 'deterministic' is implemented; "
-        "the LLM provider layer arrives with the intelligence phase.",
+        description="Reasoning strategy for planning/evaluation: 'deterministic' uses the "
+        "built-in non-LLM strategies (default, always available); 'llm' uses the "
+        "configured intelligence provider with deterministic fallback on failure.",
     )
 
     # -- Perception ----------------------------------------------------------
@@ -151,6 +152,70 @@ class SkynetSettings(BaseSettings):
     ai_request_interval_seconds: float = Field(
         default=1.0, ge=0.0, le=60.0,
         description="Politeness delay between requests to the same provider.",
+    )
+
+    # -- Intelligence / LLM provider (agency.intelligence, Phase P2) -------------
+    #: Skynet's own reasoning provider for planning, evaluation, synthesis and
+    #: memory processing. 'mock' is deterministic and offline; 'openai'
+    #: denotes any OpenAI-compatible endpoint (OPENAI_API_KEY + optional
+    #: SKYNET_LLM_BASE_URL for Ollama/vLLM/OpenRouter). Keys stay in the
+    #: environment; providers without their key refuse to activate.
+    llm_provider: Literal["mock", "openai"] = Field(
+        default="mock",
+        description="Intelligence provider implementation. 'mock' is deterministic/offline.",
+    )
+    llm_model: str = Field(
+        default="skynet-mock-1",
+        description="Model identifier handed to the provider.",
+    )
+    llm_base_url: str | None = Field(
+        default=None,
+        description="Optional OpenAI-compatible base URL (Ollama: http://localhost:11434/v1).",
+    )
+    llm_temperature: float = Field(
+        default=0.2, ge=0.0, le=2.0,
+        description="Sampling temperature for generation requests.",
+    )
+    llm_timeout_seconds: float = Field(
+        default=30.0, ge=1.0, le=600.0,
+        description="Per-request timeout for intelligence calls.",
+    )
+    llm_max_tokens: int = Field(
+        default=1024, ge=16, le=32_000,
+        description="Default maximum completion tokens per request.",
+    )
+    llm_max_retries: int = Field(
+        default=1, ge=0, le=5,
+        description="Retries for transient provider failures (timeouts/connection errors).",
+    )
+    #: How the loop picks planner/evaluator implementations (see default_provider).
+    planner_strategy: Literal["deterministic", "llm"] = "deterministic"
+    evaluator_strategy: Literal["deterministic", "llm"] = "deterministic"
+
+    # -- Long-term memory (agency.memory, Phase P2) -----------------------------
+    #: 'memory' is process-local (tests); 'sqlite' persists across restarts
+    #: with zero infrastructure (stdlib sqlite3); 'postgres' will reuse the
+    #: existing async stack in a later phase. No vector DB is introduced yet —
+    #: the store protocol is the future seam.
+    memory_backend: Literal["memory", "sqlite"] = Field(
+        default="memory",
+        description="Long-term memory persistence. 'sqlite' survives process restarts.",
+    )
+    memory_sqlite_path: str = Field(
+        default="data/skynet_memory.db",
+        description="SQLite database file for the 'sqlite' memory backend.",
+    )
+    memory_max_results: int = Field(
+        default=10, ge=1, le=100,
+        description="Default cap on memories returned by recall/search.",
+    )
+    memory_importance_threshold: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+        description="Minimum importance for a memory candidate to be stored automatically.",
+    )
+    memory_recall_max_chars: int = Field(
+        default=4000, ge=500, le=100_000,
+        description="Total character budget for memories injected into planning context.",
     )
 
     @property

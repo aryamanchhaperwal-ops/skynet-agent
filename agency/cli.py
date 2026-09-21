@@ -54,6 +54,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Explicit plan as a JSON array of {\"type\", \"params\"} steps "
         "(default: deterministic planner's built-in strategy).",
     )
+    run.add_argument(
+        "--memory-backend",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Override SKYNET_MEMORY_BACKEND for this run (sqlite persists across runs).",
+    )
     run.add_argument("--json", action="store_true", help="Print only the JSON run summary.")
 
     research = subparsers.add_parser(
@@ -144,6 +150,63 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override SKYNET_STORAGE_BACKEND for this run.",
     )
     ai_demo.add_argument("--json", action="store_true", help="Print only the JSON run summary.")
+
+    remember = subparsers.add_parser(
+        "remember",
+        help="Store one memory directly (with provenance and importance).",
+    )
+    remember.add_argument("content", help="Memory content (plain text).")
+    remember.add_argument(
+        "--type",
+        dest="memory_type",
+        choices=("episodic", "semantic", "procedural"),
+        default="semantic",
+        help="Memory type (default: semantic).",
+    )
+    remember.add_argument("--source", default="human", help="Provenance source label.")
+    remember.add_argument(
+        "--importance", type=float, default=0.8, help="Importance 0.0-1.0 (default 0.8)."
+    )
+    remember.add_argument("--tag", action="append", default=None, help="Tag (repeatable).")
+    remember.add_argument(
+        "--storage",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Override SKYNET_MEMORY_BACKEND for this command.",
+    )
+
+    recall = subparsers.add_parser(
+        "recall",
+        help="Search long-term memory (what has Skynet learned?).",
+    )
+    recall.add_argument("query", help="Keyword query.")
+    recall.add_argument(
+        "--type",
+        dest="memory_type",
+        choices=("episodic", "semantic", "procedural"),
+        default=None,
+        help="Filter by memory type.",
+    )
+    recall.add_argument("--limit", type=int, default=None, help="Max results.")
+    recall.add_argument(
+        "--storage",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Override SKYNET_MEMORY_BACKEND for this command.",
+    )
+    recall.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    stats_parser = subparsers.add_parser(
+        "memory-stats",
+        help="Show long-term memory census (counts by type and origin).",
+    )
+    stats_parser.add_argument(
+        "--storage",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Override SKYNET_MEMORY_BACKEND for this command.",
+    )
+    stats_parser.add_argument("--json", action="store_true", help="Print only JSON.")
     return parser
 
 
@@ -154,7 +217,104 @@ async def _run(args: argparse.Namespace) -> int:
         return await _run_ai_participants(args)
     if getattr(args, "command", None) in {"ai-ask", "ai-demo"}:
         return await _run_ai(args)
+    if getattr(args, "command", None) == "remember":
+        return await _run_remember(args)
+    if getattr(args, "command", None) == "recall":
+        return await _run_recall(args)
+    if getattr(args, "command", None) == "memory-stats":
+        return await _run_memory_stats(args)
     return await _run_goal(args)
+
+
+def settings_default_actions() -> str:
+    """Configured action allow-list (helper for run-command overrides)."""
+    return SkynetSettings().enabled_actions
+
+
+def _memory_settings(args: argparse.Namespace) -> SkynetSettings:
+    """Memory settings for direct memory commands (storage override only)."""
+    updates: dict[str, Any] = {}
+    if getattr(args, "storage", None):
+        updates["memory_backend"] = args.storage
+    return SkynetSettings(**updates)
+
+
+async def _run_remember(args: argparse.Namespace) -> int:
+    from agency.bootstrap import build_memory_stack
+
+    manager = build_memory_stack(_memory_settings(args)).manager
+    record = await manager.store(
+        content=args.content,
+        memory_type=args.memory_type,
+        summary=args.content[:120],
+        source=args.source,
+        origin="human",
+        importance=args.importance,
+        tags=args.tag or [],
+        force=True,  # direct operator insertion bypasses the threshold gate
+    )
+    if record is None:
+        print("error: memory rejected", file=sys.stderr)
+        return 2
+    print(f"memory stored: {record.id}")
+    print(f"  type       : {record.type.value}")
+    print(f"  importance : {record.importance:.2f}")
+    print(f"  source     : {record.source}")
+    if record.tags:
+        print(f"  tags       : {', '.join(record.tags)}")
+    return 0
+
+
+async def _run_recall(args: argparse.Namespace) -> int:
+    from agency.bootstrap import build_memory_stack
+
+    manager = build_memory_stack(_memory_settings(args)).manager
+    results = await manager.search(
+        query=args.query,
+        memory_type=args.memory_type,
+        limit=args.limit,
+    )
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": record.id,
+                        "type": record.type.value,
+                        "score": score,
+                        "summary": record.summary,
+                        "source": record.source,
+                        "provenance": record.provenance,
+                        "created_at": record.created_at.isoformat(),
+                    }
+                    for record, score in results
+                ],
+                indent=2,
+            )
+        )
+        return 0
+    if not results:
+        print("no memories found")
+        return 1
+    print(f"recalled {len(results)} memory(ies) for: {args.query}")
+    for record, score in results:
+        print(f"  - [{record.type.value}] ({score:.2f}) {record.summary or record.content[:100]}")
+        print(f"      source: {record.source} · stored {record.created_at:%Y-%m-%d %H:%M} UTC")
+    return 0
+
+
+async def _run_memory_stats(args: argparse.Namespace) -> int:
+    from agency.bootstrap import build_memory_stack
+
+    manager = build_memory_stack(_memory_settings(args)).manager
+    stats = await manager.stats()
+    if args.json:
+        print(stats.model_dump_json(indent=2))
+        return 0
+    print(f"long-term memory: {stats.total} record(s)")
+    for memory_type, count in sorted(stats.by_type.items()):
+        print(f"  {memory_type:12}: {count}")
+    return 0
 
 
 async def _run_ai_participants(args: argparse.Namespace) -> int:
@@ -199,6 +359,14 @@ async def _run_goal(args: argparse.Namespace) -> int:
             updates["perception_adapter"] = "none"
     if args.max_steps is not None:
         updates["max_steps_per_run"] = args.max_steps
+    if getattr(args, "memory_backend", None):
+        updates["memory_backend"] = args.memory_backend
+        # Opting into persistent memory for this run is explicit operator
+        # intent: allow the memory actions through the second gate too.
+        memory_actions = "memory_store,memory_search,memory_extract"
+        updates["enabled_actions"] = (
+            f"{settings_default_actions()},{memory_actions}"
+        )
     settings = SkynetSettings(**updates)
 
     if args.steps:
