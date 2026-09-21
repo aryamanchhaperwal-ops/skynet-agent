@@ -9,6 +9,8 @@ extending the category registry below — never by editing the loop.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agency.actions import (
@@ -31,6 +33,15 @@ from agency.perception import build_perception_adapter
 from agency.planner import DeterministicPlanner, Planner
 from agency.storage import DatabaseStorage, MemoryStorage, Storage
 from agency.trace import DatabaseTraceSink, LoggingTraceSink, TraceSink
+from agency.web.actions import (
+    WebExtractAction,
+    WebFetchAction,
+    WebResearchAction,
+    WebSearchAction,
+)
+from agency.web.fetcher import SafeFetcher
+from agency.web.research import ResearchService
+from agency.web.search import SearchProvider, build_search_provider
 
 #: Which feature flag unlocks which action category. Actions with a
 #: category absent from this mapping are always allowed to register.
@@ -56,6 +67,42 @@ def register_action(registry: ActionRegistry, action: Action, settings: SkynetSe
         return False
     registry.register(action)
     return True
+
+
+class WebStack(NamedTuple):
+    """The web exploration pieces, exposed for wiring and testing."""
+
+    provider: SearchProvider
+    fetcher: SafeFetcher
+    service: ResearchService
+
+
+def build_web_stack(settings: SkynetSettings) -> WebStack:
+    """Assemble the web exploration stack from settings.
+
+    Kept separate from ``build_core`` so tests and future callers can build
+    the web layer without a full core (and so its lifetime — especially the
+    owned HTTP client — stays explicit).
+    """
+    provider = build_search_provider(
+        settings.search_provider, user_agent=settings.web_user_agent
+    )
+    fetcher = SafeFetcher(
+        user_agent=settings.web_user_agent,
+        timeout=settings.web_timeout_seconds,
+        max_bytes=settings.web_max_bytes,
+        max_redirects=settings.web_max_redirects,
+        max_chars=settings.web_max_content_chars,
+        respect_robots=settings.web_respect_robots_txt,
+        blocked_hosts=settings.web_blocked_host_set,
+    )
+    service = ResearchService(
+        provider,
+        fetcher,
+        max_results_per_query=settings.web_max_results_per_query,
+        max_sources=settings.web_max_pages_per_research,
+    )
+    return WebStack(provider=provider, fetcher=fetcher, service=service)
 
 
 def build_core(
@@ -100,8 +147,20 @@ def build_core(
     register_action(registry, EchoAction(), settings)
     if database_enabled:
         register_action(registry, GodsEyeLatestEventsAction(session_factory), settings)
+    # Explicitly injected actions bypass the category gate: passing an action
+    # to ``build_core`` IS the operator's deliberate choice (tests, custom
+    # deployments, fake transports). Only bootstrap's own built-in wiring
+    # below is flag-gated.
     for action in extra_actions:
-        register_action(registry, action, settings)
+        registry.register(action)
+
+    # -- Web exploration actions (flag-gated, category 'web') -----------------
+    if settings.enable_web_tools:
+        web = build_web_stack(settings)
+        register_action(registry, WebSearchAction(web.provider), settings)
+        register_action(registry, WebFetchAction(web.fetcher), settings)
+        register_action(registry, WebExtractAction(web.fetcher), settings)
+        register_action(registry, WebResearchAction(web.service), settings)
 
     # -- Perception -------------------------------------------------------------
     session_for_perception = session_factory if database_enabled else None

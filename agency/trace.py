@@ -39,6 +39,20 @@ class TraceEventType(StrEnum):
     EVALUATION_COMPLETED = "EVALUATION_COMPLETED"
     RUN_COMPLETED = "RUN_COMPLETED"
     RUN_FAILED = "RUN_FAILED"
+    # -- Web exploration (Phase P4) -------------------------------------------
+    # Emitted by ``agency.web`` actions through the run's ``Trace`` facade so
+    # web operations share one event stream, one run_id and one seq ordering.
+    WEB_SEARCH_STARTED = "WEB_SEARCH_STARTED"
+    WEB_SEARCH_COMPLETED = "WEB_SEARCH_COMPLETED"
+    WEB_SEARCH_FAILED = "WEB_SEARCH_FAILED"
+    WEB_PAGE_FETCH_STARTED = "WEB_PAGE_FETCH_STARTED"
+    WEB_PAGE_FETCH_COMPLETED = "WEB_PAGE_FETCH_COMPLETED"
+    WEB_PAGE_FETCH_FAILED = "WEB_PAGE_FETCH_FAILED"
+    WEB_CONTENT_EXTRACTED = "WEB_CONTENT_EXTRACTED"
+    WEB_SOURCE_RECORDED = "WEB_SOURCE_RECORDED"
+    RESEARCH_STARTED = "RESEARCH_STARTED"
+    RESEARCH_COMPLETED = "RESEARCH_COMPLETED"
+    RESEARCH_FAILED = "RESEARCH_FAILED"
 
 
 class TraceEvent(BaseModel):
@@ -110,12 +124,17 @@ class Trace:
     def event_count(self) -> int:
         return self._seq
 
-    async def emit(self, event_type: TraceEventType, **payload: object) -> TraceEvent:
+    async def emit(self, event_type: TraceEventType | str, **payload: object) -> TraceEvent:
+        """Emit one event. Accepts a ``TraceEventType`` or a plain string so
+        feature modules (e.g. ``agency.web``) can define their own constants
+        without a second event system."""
         self._seq += 1
         event = TraceEvent(
             run_id=self.run_id,
             seq=self._seq,
-            event_type=event_type.value,
+            event_type=(
+                event_type.value if isinstance(event_type, TraceEventType) else str(event_type)
+            ),
             payload=dict(payload),
         )
         for sink in self._sinks:

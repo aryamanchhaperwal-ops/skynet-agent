@@ -41,6 +41,7 @@ from agency.config import SkynetSettings
 from agency.evaluator import Evaluation, Evaluator
 from agency.experience import ExperienceRecorder
 from agency.goals import Goal, GoalManager, GoalSpec
+from agency.observation import Observation
 from agency.perception import PerceptionAdapter
 from agency.planner import Plan, Planner
 from agency.state import AgentState
@@ -247,6 +248,37 @@ class SkynetCore:
                         "error": result.error,
                     }
                 )
+                # Absorb action-produced observations into state. Actions that
+                # generate perceivable data (web research, future comms) attach
+                # an ``skynet_observations`` list of Observation-shaped dicts to
+                # their output; the loop normalizes and traces them with the
+                # run/goal linkage, exactly like perception observations.
+                observations_from_action = self._extract_observations(result)
+                for observation in observations_from_action:
+                    observation.run_id = run_id
+                    observation.goal_id = goal.id
+                    state.add_observation(observation)
+                    await tracer.emit(
+                        TraceEventType.OBSERVATION_RECEIVED,
+                        observation_id=observation.id,
+                        source=observation.source,
+                        kind=observation.kind,
+                    )
+                if observations_from_action:
+                    self._experiences.record(
+                        run_id=run_id,
+                        goal_id=goal.id,
+                        kind="observation",
+                        summary=f"{len(observations_from_action)} observation(s) from "
+                        f"{result.action_type}",
+                        payload={
+                            "count": len(observations_from_action),
+                            "source_action": result.action_type,
+                        },
+                        outcome="neutral",
+                    )
+                    experience_count += 1
+                    await self._safe_flush()
                 self._experiences.record(
                     run_id=run_id,
                     goal_id=goal.id,
@@ -399,6 +431,30 @@ class SkynetCore:
         except Exception:
             logger.exception("Skynet run: experience flush failed")
 
+    @staticmethod
+    def _extract_observations(result: ActionResult) -> list[Observation]:
+        """Pull ``skynet_observations`` entries out of an action's output.
+
+        Malformed entries are skipped (never crash the run); the conversion
+        happens through the same Observation model the perception boundary
+        uses, so downstream consumers see one uniform shape.
+        """
+        output = result.output
+        if not isinstance(output, dict):
+            return []
+        raw = output.get("skynet_observations")
+        if not isinstance(raw, list):
+            return []
+        observations: list[Observation] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                observations.append(Observation(**entry))
+            except Exception:
+                logger.debug("skipped malformed observation from action output: %r", entry)
+        return observations
+
     async def _execute_step(
         self,
         spec: ActionSpec,
@@ -430,6 +486,7 @@ class SkynetCore:
             run_id=run_id,
             goal_id=goal_id,
             state_snapshot=state.model_dump(mode="json"),
+            tracer=tracer,
         )
         await tracer.emit(TraceEventType.ACTION_STARTED, action_id=spec.id, action_type=spec.type)
         return await run_action(action, spec, ctx)

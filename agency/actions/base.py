@@ -16,6 +16,7 @@ writes, knowledge queries, experiments) plug in by subclassing
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -23,6 +24,8 @@ from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("skynet.actions")
 
 
 def _utcnow() -> datetime:
@@ -71,6 +74,20 @@ class ActionContext(BaseModel):
     goal_id: str | None = None
     #: Serializable snapshot of the agent state at selection time.
     state_snapshot: dict[str, Any] = Field(default_factory=dict)
+    #: The run's :class:`agency.trace.Trace` facade (optional). Actions that
+    #: perform multi-part work (e.g. web search / fetch / research) emit their
+    #: own lifecycle events through it, keeping one event stream per run.
+    #: Excluded from serialization: it is a live object, not data.
+    tracer: Any = Field(default=None, exclude=True, repr=False)
+
+    async def emit_trace(self, event_type: str, **payload: Any) -> None:
+        """Emit a trace event if a tracer is attached; never raises."""
+        if self.tracer is None:
+            return
+        try:
+            await self.tracer.emit(event_type, **payload)
+        except Exception:  # pragma: no cover - tracer failure must not fail actions
+            logger.exception("action %s failed to emit trace event %s", self.run_id, event_type)
 
 
 class Action(ABC):

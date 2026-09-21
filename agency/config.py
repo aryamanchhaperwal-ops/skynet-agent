@@ -56,7 +56,10 @@ class SkynetSettings(BaseSettings):
 
     # -- Tool availability ----------------------------------------------------
     #: Comma-separated action names the loop may execute. Actions present in
-    #: the registry but missing here are refused at selection time.
+    #: the registry but missing here are refused at selection time. Enabling
+    #: SKYNET_ENABLE_WEB_TOOLS without adding the web_* names here means the
+    #: actions register but are refused at selection time — a deliberate
+    #: second gate.
     enabled_actions: str = "echo,gods_eye_latest_events"
 
     # -- Execution limits (budgets) -------------------------------------------
@@ -76,6 +79,53 @@ class SkynetSettings(BaseSettings):
         default=False,
         description="Allows the loop to submit improvement proposals to the lab. Phase P7.",
     )
+
+    # -- Web exploration (agency.web, Phase P4) --------------------------------
+    #: 'wikipedia' is the keyless default (open MediaWiki API, automation-
+    #: friendly). 'duckduckgo' exists but currently serves an anomaly/202 page
+    #: to scripted clients; keyed commercial providers slot in later.
+    search_provider: Literal["wikipedia", "duckduckgo", "none"] = "wikipedia"
+    #: Descriptive UA: some sites 403 generic clients. Not a spoof — it names
+    #: this agent and points at a contact path per robots-ethics convention.
+    web_user_agent: str = (
+        "SKYNET-ResearchBot/0.1 (+https://github.com/skynet-intel; research agent, "
+        "respectful of robots.txt)"
+    )
+    web_timeout_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
+    web_max_pages_per_research: int = Field(default=8, ge=1, le=50)
+    web_max_results_per_query: int = Field(default=10, ge=1, le=100)
+    web_max_content_chars: int = Field(
+        default=20000, ge=1000, le=1_000_000,
+        description="Per-page extracted text cap (bounded payloads, no huge HTML dumps).",
+    )
+    web_max_bytes: int = Field(
+        default=2_000_000, ge=10_000, le=50_000_000,
+        description="Per-response download cap; larger bodies are truncated, not parsed.",
+    )
+    web_max_redirects: int = Field(default=5, ge=0, le=10)
+    web_min_request_interval_seconds: float = Field(
+        default=1.0, ge=0.0, le=60.0,
+        description="Politeness delay between requests to the same host (rate-limit respect).",
+    )
+    web_respect_robots_txt: bool = Field(
+        default=True,
+        description="Fetch robots.txt and refuse disallowed paths. Disable only for tests.",
+    )
+    web_blocked_hosts: str = Field(
+        default="localhost,127.0.0.1,0.0.0.0,::1,169.254.169.254,metadata.google.internal",
+        description="Comma-separated hosts the fetcher always refuses (SSRF guard).",
+    )
+    web_offline_mode: bool = Field(
+        default=False,
+        description="When true, web tools fail fast with a structured offline error "
+        "(CI, deterministic demos). Search results are never synthesized.",
+    )
+
+    @property
+    def web_blocked_host_set(self) -> frozenset[str]:
+        return frozenset(
+            host.strip().lower() for host in self.web_blocked_hosts.split(",") if host.strip()
+        )
 
     @field_validator("log_level")
     @classmethod

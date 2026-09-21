@@ -116,9 +116,22 @@ def test_extra_actions_flow_into_core(memory_settings) -> None:
     assert "web_probe" in core._actions
 
 
-def test_gated_action_not_registered_even_if_requested(memory_settings) -> None:
-    core = build_core(memory_settings, extra_actions=(CommsProbeAction(),))
+def test_builtin_gated_action_not_registered_when_flag_off(memory_settings) -> None:
+    """Bootstrap's own category wiring is flag-gated: with the comms flag off,
+    no comms action appears unless explicitly injected via extra_actions."""
+    core = build_core(memory_settings)
     assert "comms_probe" not in core._actions
+    # Bootstrap never auto-registers comms/lab actions today; the flag only
+    # gates built-in wiring (web). Explicit injection is the operator's own
+    # choice and is allowed through (see test_explicit_injection_bypasses_flag).
+
+
+def test_explicit_injection_bypasses_flag(memory_settings) -> None:
+    """Actions passed to build_core(extra_actions=...) are the caller's
+    deliberate choice and register regardless of category flags — this is
+    how tests and custom deployments swap transports."""
+    core = build_core(memory_settings, extra_actions=(CommsProbeAction(),))
+    assert "comms_probe" in core._actions
 
 
 def test_database_components_lazy_construction() -> None:
