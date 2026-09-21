@@ -53,6 +53,18 @@ class TraceEventType(StrEnum):
     RESEARCH_STARTED = "RESEARCH_STARTED"
     RESEARCH_COMPLETED = "RESEARCH_COMPLETED"
     RESEARCH_FAILED = "RESEARCH_FAILED"
+    # -- AI ↔ AI communication (Phase P5) --------------------------------------
+    # Emitted by ``agency.comms`` actions through the run's ``Trace`` facade so
+    # external-AI interactions share one event stream, one run_id, one ordering.
+    # Payloads never contain credentials or API keys.
+    AI_PARTICIPANT_DISCOVERED = "AI_PARTICIPANT_DISCOVERED"
+    AI_CONVERSATION_STARTED = "AI_CONVERSATION_STARTED"
+    AI_MESSAGE_SENT = "AI_MESSAGE_SENT"
+    AI_RESPONSE_RECEIVED = "AI_RESPONSE_RECEIVED"
+    AI_CONVERSATION_CONTINUED = "AI_CONVERSATION_CONTINUED"
+    AI_RESPONSE_ANALYZED = "AI_RESPONSE_ANALYZED"
+    AI_CONVERSATION_COMPLETED = "AI_CONVERSATION_COMPLETED"
+    AI_CONVERSATION_FAILED = "AI_CONVERSATION_FAILED"
 
 
 class TraceEvent(BaseModel):

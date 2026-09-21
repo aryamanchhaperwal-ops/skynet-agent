@@ -23,7 +23,9 @@ GOAL → OBSERVE → PLAN → SELECT ACTION → EXECUTE → RECORD EXPERIENCE
 
 | Module | Responsibility |
 |---|---|
-| `agency/config.py` | `SkynetSettings` (pydantic-settings, `SKYNET_` prefix): storage backend, provider, perception source, action allow-list, run budgets, **dark capability flags** (`SKYNET_ENABLE_WEB_TOOLS/EXTERNAL_COMMS/SELF_IMPROVEMENT` — all default false) |
+| `agency/config.py` | `SkynetSettings` (pydantic-settings, `SKYNET_` prefix): storage backend, provider, perception source, action allow-list, run budgets, **dark capability flags** (`SKYNET_ENABLE_WEB_TOOLS/EXTERNAL_COMMS/SELF_IMPROVEMENT` — all default false) + web/comms tuning blocks |
+| `agency/web/` | Web exploration engine (Phase P4): search providers, safe fetcher, extractor, research orchestrator, web actions |
+| `agency/comms/` | AI ↔ AI communication (Phase P5): provider interface + registry, bounded conversation manager, security boundary, comparison, ai_* actions |
 | `agency/observation.py` | `Observation` — the perception boundary currency (source, kind, content, confidence, timestamps, goal/run linkage). Content is `Any`: text, JSON, GeoJSON, tool output, error |
 | `agency/state.py` | `AgentState` — serializable runtime state: run/goal ids, step cursor, observations, action records, errors, context, timestamps |
 | `agency/goals.py` | `Goal`/`GoalSpec`/`GoalManager` — creation, priority, metadata, and the **status state machine** (`pending → running → paused/completed/failed/cancelled`) with illegal-transition rejection |

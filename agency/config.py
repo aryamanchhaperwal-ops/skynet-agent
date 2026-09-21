@@ -121,6 +121,38 @@ class SkynetSettings(BaseSettings):
         "(CI, deterministic demos). Search results are never synthesized.",
     )
 
+    # -- AI ↔ AI communication (agency.comms, Phase P5) -------------------------
+    #: Enabled external AI participants. ``mock`` is a deterministic, offline
+    #: provider for tests and demos. Real providers (e.g. ``anthropic``) activate
+    #: only when the required key exists in the environment AND the operator
+    #: lists them here — no key discovery, no silent fallback to paid APIs.
+    ai_providers: str = Field(
+        default="mock",
+        description="Comma-separated external AI provider names to activate."
+        " 'mock' is offline and deterministic; real providers need env keys.",
+    )
+    ai_conversation_timeout_seconds: float = Field(
+        default=30.0, ge=1.0, le=600.0,
+        description="Per-provider-request timeout for external AI calls.",
+    )
+    ai_max_turns_per_conversation: int = Field(
+        default=5, ge=1, le=50,
+        description="Hard cap on Skynet→AI turns; prevents runaway conversations.",
+    )
+    ai_max_retries: int = Field(
+        default=1, ge=0, le=10,
+        description="Retries per failed AI request (exponential backoff not needed at this scale).",
+    )
+    ai_max_request_cost_usd: float | None = Field(
+        default=None,
+        description="Optional per-request cost ceiling (USD). Providers reporting usage "
+        "metadata above this refuse to send.",
+    )
+    ai_request_interval_seconds: float = Field(
+        default=1.0, ge=0.0, le=60.0,
+        description="Politeness delay between requests to the same provider.",
+    )
+
     @property
     def web_blocked_host_set(self) -> frozenset[str]:
         return frozenset(

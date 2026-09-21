@@ -19,6 +19,14 @@ from agency.actions import (
     EchoAction,
     GodsEyeLatestEventsAction,
 )
+from agency.comms.actions import (
+    AIAskAction,
+    AICompareAction,
+    AIListParticipantsAction,
+)
+from agency.comms.compare import ComparisonService
+from agency.comms.manager import ConversationManager
+from agency.comms.providers import AIProviderRegistry, build_providers_from_list
 from agency.config import SkynetSettings
 from agency.evaluator import DeterministicEvaluator, Evaluator
 from agency.experience import (
@@ -77,6 +85,14 @@ class WebStack(NamedTuple):
     service: ResearchService
 
 
+class CommsStack(NamedTuple):
+    """The AI-communication pieces, exposed for wiring and testing."""
+
+    registry: AIProviderRegistry
+    manager: ConversationManager
+    comparison: ComparisonService
+
+
 def build_web_stack(settings: SkynetSettings) -> WebStack:
     """Assemble the web exploration stack from settings.
 
@@ -103,6 +119,39 @@ def build_web_stack(settings: SkynetSettings) -> WebStack:
         max_sources=settings.web_max_pages_per_research,
     )
     return WebStack(provider=provider, fetcher=fetcher, service=service)
+
+
+def build_comms_stack(
+    settings: SkynetSettings,
+    *,
+    providers: tuple[object, ...] | None = None,
+) -> CommsStack:
+    """Assemble the AI-communication stack from settings.
+
+    Only providers named in ``SKYNET_AI_PROVIDERS`` are activated; the factory
+    raises for unknown names rather than inventing behavior. ``providers``
+    (optional) replaces name-based construction — used by tests and the
+    ``ai-demo`` command to inject provider instances with distinct
+    participants/scenarios. Kept separate from ``build_core`` so tests can
+    build comms without a full core.
+    """
+    registry = AIProviderRegistry()
+    if providers is not None:
+        for provider in providers:
+            registry.register(provider)  # type: ignore[arg-type]
+    else:
+        # Repeated names become independent participants (mock#2, mock#3…).
+        for provider in build_providers_from_list(settings.ai_providers.split(",")):
+            registry.register(provider)
+    manager = ConversationManager(
+        registry,
+        max_turns=settings.ai_max_turns_per_conversation,
+        request_timeout=settings.ai_conversation_timeout_seconds,
+        max_retries=settings.ai_max_retries,
+        request_interval=settings.ai_request_interval_seconds,
+    )
+    comparison = ComparisonService(manager)
+    return CommsStack(registry=registry, manager=manager, comparison=comparison)
 
 
 def build_core(
@@ -161,6 +210,13 @@ def build_core(
         register_action(registry, WebFetchAction(web.fetcher), settings)
         register_action(registry, WebExtractAction(web.fetcher), settings)
         register_action(registry, WebResearchAction(web.service), settings)
+
+    # -- AI communication actions (flag-gated, category 'comms') ---------------
+    if settings.enable_external_comms:
+        comms = build_comms_stack(settings)
+        register_action(registry, AIListParticipantsAction(comms.manager), settings)
+        register_action(registry, AIAskAction(comms.manager), settings)
+        register_action(registry, AICompareAction(comms.manager, comms.comparison), settings)
 
     # -- Perception -------------------------------------------------------------
     session_for_perception = session_factory if database_enabled else None

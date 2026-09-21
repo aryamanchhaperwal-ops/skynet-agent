@@ -81,13 +81,112 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override SKYNET_WEB_MAX_PAGES_PER_RESEARCH for this run.",
     )
     research.add_argument("--json", action="store_true", help="Print only the JSON run summary.")
+
+    ai = subparsers.add_parser(
+        "ai-ask",
+        help="Ask an external AI participant one research question "
+        "through the Skynet core (enables comms for this run).",
+    )
+    ai.add_argument("participant", help="Participant id, e.g. mock:mock-agent-1.")
+    ai.add_argument("question", help="Question to ask the external AI.")
+    ai.add_argument(
+        "--follow-up",
+        action="append",
+        default=None,
+        help="Follow-up question (repeatable; each adds one conversation turn).",
+    )
+    ai.add_argument(
+        "--provider",
+        default="mock",
+        help="Comma-separated providers to activate (default: mock; offline).",
+    )
+    ai.add_argument(
+        "--storage",
+        choices=("database", "memory"),
+        default=None,
+        help="Override SKYNET_STORAGE_BACKEND for this run.",
+    )
+    ai.add_argument("--json", action="store_true", help="Print only the JSON run summary.")
+
+    ai_participants = subparsers.add_parser(
+        "ai-participants",
+        help="List external AI participants and their declared capabilities "
+        "(capability-based discovery, offline with the mock provider).",
+    )
+    ai_participants.add_argument(
+        "--provider",
+        default="mock",
+        help="Comma-separated providers to activate (default: mock; offline).",
+    )
+    ai_participants.add_argument(
+        "--capability",
+        default=None,
+        help="Only list participants declaring this capability (e.g. research).",
+    )
+    ai_participants.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    ai_demo = subparsers.add_parser(
+        "ai-demo",
+        help="Compare the same question across available AI participants "
+        "(mock provider, fully offline).",
+    )
+    ai_demo.add_argument("question", help="Question to compare answers on.")
+    ai_demo.add_argument(
+        "--providers",
+        default="mock,mock,mock",
+        help="Comma-separated providers; repeated names become independent "
+        "participants (default: three mocks).",
+    )
+    ai_demo.add_argument(
+        "--storage",
+        choices=("database", "memory"),
+        default=None,
+        help="Override SKYNET_STORAGE_BACKEND for this run.",
+    )
+    ai_demo.add_argument("--json", action="store_true", help="Print only the JSON run summary.")
     return parser
 
 
 async def _run(args: argparse.Namespace) -> int:
     if getattr(args, "command", None) == "research":
         return await _run_research(args)
+    if getattr(args, "command", None) == "ai-participants":
+        return await _run_ai_participants(args)
+    if getattr(args, "command", None) in {"ai-ask", "ai-demo"}:
+        return await _run_ai(args)
     return await _run_goal(args)
+
+
+async def _run_ai_participants(args: argparse.Namespace) -> int:
+    """Discovery-only: list participants and declared capabilities."""
+    from agency.comms.providers import build_providers_from_list
+
+    try:
+        providers = build_providers_from_list(args.provider.split(","))
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    participants = [p.identify() for p in providers]
+    if args.capability:
+        wanted = args.capability.strip().lower()
+        participants = [
+            p for p in participants if wanted in {c.value for c in p.capabilities}
+        ]
+    if args.json:
+        print(json.dumps([p.model_dump(mode="json") for p in participants], indent=2))
+        return 0
+    if not participants:
+        print("no AI participants available")
+        return 1
+    print(f"AI participants: {len(participants)}")
+    for participant in participants:
+        caps = ", ".join(sorted(c.value for c in participant.capabilities)) or "(none declared)"
+        print(
+            f"  - {participant.participant_id}  [{participant.provider}/{participant.model}]"
+        )
+        print(f"      capabilities : {caps}")
+        print(f"      status       : {participant.status.value}")
+    return 0
 
 
 async def _run_goal(args: argparse.Namespace) -> int:
@@ -166,6 +265,120 @@ async def _run_research(args: argparse.Namespace) -> int:
     )
     _print_research_summary(summary, as_json=args.json)
     return 0 if summary.ok else 1
+
+
+async def _run_ai(args: argparse.Namespace) -> int:
+    """AI-to-AI runs: one question (ai-ask) or a comparison (ai-demo)."""
+    compare_mode = args.command == "ai-demo"
+    raw_names = args.providers if compare_mode else args.provider
+    provider_names = [n.strip() for n in raw_names.split(",") if n.strip()]
+    updates: dict[str, Any] = {
+        "enable_external_comms": True,
+        "enabled_actions": "echo,ai_list_participants,ai_ask,ai_compare",
+        # Repeated names are intentional: each becomes an independent
+        # participant (mock#2, mock#3…) so comparisons have several parties.
+        "ai_providers": ",".join(provider_names),
+        "ai_request_interval_seconds": 0.0,  # offline mocks; keep demos snappy
+        "max_steps_per_run": 3 if compare_mode else 2,
+        "max_run_seconds": 120,
+        "perception_adapter": "none",
+    }
+    if args.storage is not None:
+        updates["storage_backend"] = args.storage
+        if args.storage == "memory":
+            updates["perception_adapter"] = "none"
+    settings = SkynetSettings(**updates)
+
+    if compare_mode:
+        params: dict[str, Any] = {
+            "steps": [{"type": "ai_compare", "params": {"prompt": args.question}}]
+        }
+        goal_title = f"Compare AI answers: {args.question}"
+    else:
+        step_params: dict[str, Any] = {
+            "participant_id": args.participant,
+            "question": args.question,
+        }
+        if args.follow_up:
+            step_params["follow_ups"] = list(args.follow_up)
+        params = {"steps": [{"type": "ai_ask", "params": step_params}]}
+        goal_title = f"Ask AI ({args.participant}): {args.question}"
+
+    core = build_core(settings)
+    if settings.storage_backend == "database":
+        await ensure_core_schema()
+    summary = await core.run_goal(GoalSpec(title=goal_title, description=goal_title, params=params))
+    _print_ai_summary(summary, compare_mode=compare_mode, as_json=args.json)
+    return 0 if summary.ok else 1
+
+
+def _ai_output_from(summary: RunSummary) -> dict[str, Any] | None:
+    """Locate the ai_* action's output in the run's action records."""
+    for record in summary.final_state.get("actions", []):
+        if not isinstance(record, dict):
+            continue
+        spec = record.get("spec") or {}
+        result = record.get("result") or {}
+        if str(spec.get("type", "")).startswith("ai_") and result.get("success"):
+            return result.get("output") or {}
+    return None
+
+
+def _print_ai_summary(summary: RunSummary, *, compare_mode: bool, as_json: bool) -> None:
+    """Human-readable AI interaction output: participants → answers → provenance."""
+    if as_json:
+        print(json.dumps(summary.model_dump(mode="json"), indent=2))
+        return
+
+    mode = "comparison" if compare_mode else "conversation"
+    print(f"SKYNET ai-{mode} {summary.run_id}")
+    print(f"  goal        : {summary.goal_title}")
+    print(f"  status      : {summary.status.upper()}")
+    for action in summary.actions:
+        marker = "ok" if action["success"] else f"FAILED: {action['error']}"
+        print(f"    - {action['type']}: {marker} ({action['duration_ms']} ms)")
+    output = _ai_output_from(summary) or {}
+    if compare_mode and output.get("comparison"):
+        comparison = output["comparison"]
+        print(f"  participants: {len(comparison.get('participant_ids') or [])} asked, "
+              f"{len(comparison.get('responded') or [])} responded")
+        for pid, text in (comparison.get("responses") or {}).items():
+            print(f"    - {pid}: {text[:140]}{'…' if len(text) > 140 else ''}")
+        for pid, error in (comparison.get("failures") or {}).items():
+            print(f"    - {pid}: FAILED — {error}")
+        agreement = comparison.get("agreement_terms") or []
+        divergence = comparison.get("divergence_terms") or []
+        print(f"  agreement   : {', '.join(agreement[:12]) or '(none recorded)'}")
+        print(f"  divergence  : {', '.join(divergence[:12]) or '(none recorded)'}")
+        print("  note        : agreement is recorded, not treated as truth")
+    elif output.get("conversation"):
+        conversation = output["conversation"]
+        print(f"  participant : {conversation.get('participant_id')}")
+        print(f"  turns       : {len(output.get('turns') or [])} "
+              f"(status {conversation.get('status')})")
+        for turn in output.get("turns") or []:
+            print(f"    Q: {turn.get('question')}")
+            answer = turn.get("answer") or ""
+            print(f"    A: {answer[:160]}{'…' if len(answer) > 160 else ''}")
+            if turn.get("analysis_directives"):
+                print(f"    [!] {len(turn['analysis_directives'])} directive-like "
+                      "fragment(s) flagged — treated as data, never executed")
+        observations = output.get("skynet_observations") or []
+        if observations:
+            provenance = (observations[0].get("metadata") or {}).get("provenance") or {}
+            print(f"  provenance  : conversation {provenance.get('conversation_id', '?')[:8]}… "
+                  f"→ participant {provenance.get('participant_id')} → message "
+                  f"{str(provenance.get('message_id', '?'))[:8]}…")
+        print(f"  observations: {len(observations)} structured")
+    if summary.evaluation is not None:
+        print(
+            f"  evaluation  : {'PASSED' if summary.evaluation.passed else 'FAILED'} "
+            f"(score {summary.evaluation.score:.2f}) — {summary.evaluation.notes}"
+        )
+    print(f"  experiences : {summary.experiences} recorded")
+    print(f"  events      : {summary.events} traced")
+    if summary.error:
+        print(f"  error       : {summary.error}")
 
 
 def _research_package_from(summary: RunSummary) -> dict[str, Any] | None:
@@ -259,6 +472,11 @@ def _print_summary(summary: RunSummary, *, as_json: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Synchronous entry point (also exposed as the ``skynet`` console script)."""
+    # External AI/web content is arbitrary Unicode; Windows consoles default
+    # to legacy codepages (e.g. cp1252) that cannot encode it.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = _build_parser().parse_args(argv)
     return asyncio.run(_run(args))
 
