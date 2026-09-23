@@ -207,6 +207,89 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override SKYNET_MEMORY_BACKEND for this command.",
     )
     stats_parser.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    # -- Experiments (agency.experiments, Phase P6) ------------------------------
+    experiment = subparsers.add_parser(
+        "experiment",
+        help="Run, list or inspect controlled experiments (offline demo included).",
+    )
+    experiment_sub = experiment.add_subparsers(dest="experiment_command", required=True)
+
+    exp_run = experiment_sub.add_parser(
+        "run",
+        help="Run one experiment: baseline vs candidate strategy with criteria.",
+    )
+    exp_run.add_argument("--name", required=True, help="Experiment name.")
+    exp_run.add_argument(
+        "--hypothesis", required=True, help="Testable claim (one sentence)."
+    )
+    exp_run.add_argument(
+        "--baseline", required=True, help="Baseline strategy ref, e.g. single_query:v1."
+    )
+    exp_run.add_argument(
+        "--candidate", required=True, help="Candidate strategy ref, e.g. multi_query:v1."
+    )
+    exp_run.add_argument(
+        "--criterion",
+        action="append",
+        required=True,
+        help="Frozen acceptance criterion as JSON: '{\"kind\": \"improves\", "
+        "\"metric\": \"sources_found\", \"threshold\": 0.1}' (repeatable).",
+    )
+    exp_run.add_argument(
+        "--metric",
+        action="append",
+        default=None,
+        help="Metric definition 'name[:direction]' (repeatable; direction maximize|minimize).",
+    )
+    exp_run.add_argument("--trials", type=int, default=3, help="Trials per arm (default 3).")
+    exp_run.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
+    exp_run.add_argument(
+        "--memory-backend",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Where experiment memories are recorded (sqlite persists across runs).",
+    )
+    exp_run.add_argument(
+        "--param",
+        action="append",
+        default=None,
+        help="Procedure parameter key=value (repeatable), e.g. --param goal=agent memory.",
+    )
+    exp_run.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    exp_list = experiment_sub.add_parser(
+        "list", help="List previously run experiments (have I tried this before?)."
+    )
+    exp_list.add_argument(
+        "--status", default=None, help="Filter by status (completed/failed/inconclusive/...)."
+    )
+    exp_list.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    exp_inspect = experiment_sub.add_parser(
+        "inspect", help="Show one experiment's full record (criteria, trials, verdict)."
+    )
+    exp_inspect.add_argument("experiment_id", help="Experiment id (from experiment list).")
+    exp_inspect.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    experiment_sub.add_parser(
+        "demo",
+        help="Run the built-in offline demo: single-query vs multi-query "
+        "research strategies over an injected corpus (deterministic).",
+    )
+    exp_demo = experiment_sub.choices["demo"]  # type: ignore[index]
+    exp_demo.add_argument(
+        "--goal", default="approaches to long-term memory in autonomous AI agents",
+        help="Research goal the strategies search for.",
+    )
+    exp_demo.add_argument("--trials", type=int, default=5, help="Trials per arm (default 5).")
+    exp_demo.add_argument(
+        "--memory-backend",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Where experiment memories are recorded (sqlite persists across runs).",
+    )
+    exp_demo.add_argument("--json", action="store_true", help="Print only JSON.")
     return parser
 
 
@@ -223,6 +306,8 @@ async def _run(args: argparse.Namespace) -> int:
         return await _run_recall(args)
     if getattr(args, "command", None) == "memory-stats":
         return await _run_memory_stats(args)
+    if getattr(args, "command", None) == "experiment":
+        return await _run_experiment(args)
     return await _run_goal(args)
 
 
@@ -636,6 +721,298 @@ def _print_summary(summary: RunSummary, *, as_json: bool) -> None:
         print(f"  strongest   : M{strongest.get('magnitude')} — {strongest.get('place')}")
     if result.get("summary"):
         print(f"  summary     : {result['summary']}")
+
+
+# -- Experiment commands (Phase P6) -----------------------------------------------
+
+
+def _lab_stack(args: argparse.Namespace):
+    """Build the lab stack with the demo strategies registered."""
+    from agency.bootstrap import build_lab_stack
+    from agency.config import SkynetSettings
+    from agency.experiments.demo import register_demo_strategies
+
+    settings = SkynetSettings()
+    stack = build_lab_stack(settings)
+    register_demo_strategies(stack.strategies)
+    return stack
+
+
+def _experiment_memory(args: argparse.Namespace):
+    """Memory manager for experiment recording (backend per operator flag)."""
+    from agency.bootstrap import build_memory_stack
+    from agency.config import SkynetSettings
+
+    updates: dict[str, Any] = {}
+    backend = getattr(args, "memory_backend", None)
+    if backend:
+        updates["memory_backend"] = backend
+    return build_memory_stack(SkynetSettings(**updates)).manager
+
+
+def _parse_criterion(raw: str) -> dict[str, Any]:
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"error: --criterion is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit("error: --criterion must be a JSON object")
+    return parsed
+
+
+async def _run_experiment(args: argparse.Namespace) -> int:
+    from agency.experiments.experiments_store import ExperimentRegistry
+    from agency.experiments.memory_bridge import record_experiment
+    from agency.experiments.models import (
+        Experiment,
+        Hypothesis,
+        MetricDefinition,
+        SuccessCriterion,
+        TargetRef,
+    )
+    from agency.experiments.runner import ExperimentRunner
+
+    command = args.experiment_command
+
+    if command == "list":
+        store = ExperimentRegistry()
+        summaries = await store.list(status=args.status)
+        if args.json:
+            print(json.dumps([s.model_dump(mode="json") for s in summaries], indent=2))
+            return 0
+        if not summaries:
+            print("no experiments recorded")
+            return 1
+        print(f"experiments: {len(summaries)}")
+        for item in summaries:
+            verdict = item.verdict.value if item.verdict else "—"
+            print(
+                f"  - {item.id[:12]}  {item.status.value:12}  {verdict:12} "
+                f"{item.baseline} vs {item.candidate} ({item.trials} trials)"
+            )
+            print(f"      created {item.created_at:%Y-%m-%d %H:%M} UTC")
+        return 0
+
+    if command == "inspect":
+        store = ExperimentRegistry()
+        record = await store.get(args.experiment_id)
+        if record is None:
+            print(f"error: unknown experiment {args.experiment_id!r}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(record.model_dump_json(indent=2))
+            return 0
+        _print_experiment_detail(record)
+        return 0
+
+    if command == "demo":
+        return await _run_experiment_demo(args)
+
+    # -- run ------------------------------------------------------------------
+    stack = _lab_stack(args)
+    criteria: list[SuccessCriterion] = []
+    for raw in args.criterion or []:
+        parsed = _parse_criterion(raw)
+        try:
+            criteria.append(
+                SuccessCriterion(
+                    kind=parsed["kind"],
+                    metric=parsed["metric"],
+                    threshold=float(parsed.get("threshold", 0.0)),
+                )
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            print(f"error: invalid criterion {raw!r}: {exc}", file=sys.stderr)
+            return 2
+    metrics = []
+    for raw in args.metric or []:
+        name, _, direction = raw.partition(":")
+        metrics.append(MetricDefinition(name=name, direction=direction or "maximize"))
+    procedure_params: dict[str, Any] = {}
+    for raw in args.param or []:
+        key, _, value = raw.partition("=")
+        procedure_params[key.strip()] = value
+
+    experiment = Experiment(
+        name=args.name,
+        hypothesis=Hypothesis(
+            statement=args.hypothesis,
+            success_criteria=criteria,
+            provenance={"proposed_by": "human"},
+        ),
+        baseline=TargetRef(
+            name=args.baseline.split(":")[0], version=args.baseline.split(":")[1]
+        ),
+        candidate=TargetRef(
+            name=args.candidate.split(":")[0], version=args.candidate.split(":")[1]
+        ),
+        metrics=metrics,
+        trials=args.trials,
+        seed=args.seed,
+        procedure_params=procedure_params,
+    )
+    from agency.experiments.demo import _CORPUS
+
+    runner = ExperimentRunner(stack.strategies, services={"search_corpus": _CORPUS})
+    finished = await runner.run(experiment)
+    store = ExperimentRegistry()
+    await store.save(finished)
+    stored = await record_experiment(finished, _experiment_memory(args))
+    if args.json:
+        print(finished.model_dump_json(indent=2))
+        return 0 if finished.evaluation and finished.evaluation.verdict.value in {
+            "success", "failure", "inconclusive"
+        } else 1
+    _print_experiment_detail(finished)
+    if stored:
+        print(f"  memories    : {len(stored)} stored from this experiment")
+    return 0 if finished.evaluation else 1
+
+
+async def _run_experiment_demo(args: argparse.Namespace) -> int:
+    """Built-in offline experiment: real measurements, no network, no APIs."""
+    from agency.experiments.experiments_store import ExperimentRegistry
+    from agency.experiments.memory_bridge import record_experiment
+    from agency.experiments.models import (
+        Experiment,
+        Hypothesis,
+        MetricDefinition,
+        SuccessCriterion,
+        TargetRef,
+    )
+    from agency.experiments.runner import ExperimentRunner
+
+    stack = _lab_stack(args)
+    goal = args.goal
+    experiment = Experiment(
+        name="research-strategy-demo",
+        objective=f"Compare research query strategies for: {goal}",
+        description=(
+            "Offline demo: single-query (baseline) vs multi-query (candidate) "
+            "research strategies against an injected deterministic corpus."
+        ),
+        hypothesis=Hypothesis(
+            statement=(
+                "A multi-query research strategy discovers more unique sources "
+                "than a single-query strategy, without a materially higher "
+                "duplicate rate."
+            ),
+            rationale="more diverse queries should cover more of the corpus",
+            success_criteria=[
+                SuccessCriterion(
+                    kind="improves", metric="sources_found", threshold=0.15
+                ),
+                # Absolute cap: duplicate_rate's baseline is 0 by construction,
+                # so a relative criterion is unmeasurable there. Threshold
+                # sized for the union-of-4-queries dedupe arithmetic.
+                SuccessCriterion(
+                    kind="max", metric="duplicate_rate", threshold=0.8
+                ),
+                SuccessCriterion(
+                    kind="max", metric="duration_ms", threshold=50.0
+                ),
+            ],
+            provenance={"proposed_by": "human", "demo": True},
+        ),
+        baseline=TargetRef(name="single_query", version="v1"),
+        candidate=TargetRef(name="multi_query", version="v1"),
+        metrics=[
+            MetricDefinition(
+                name="sources_found", direction="maximize",
+                description="unique source URLs discovered",
+            ),
+            MetricDefinition(
+                name="duplicate_rate", direction="minimize",
+                description="1 − unique/discovered results",
+            ),
+            MetricDefinition(name="search_errors", direction="minimize"),
+            MetricDefinition(name="duration_ms", direction="minimize"),
+        ],
+        trials=args.trials,
+        seed=42,
+        procedure_params={"goal": goal},
+    )
+
+    from agency.experiments.demo import _CORPUS
+
+    runner = ExperimentRunner(
+        stack.strategies, services={"search_corpus": _CORPUS}
+    )
+    finished = await runner.run(experiment)
+    await ExperimentRegistry().save(finished)
+    stored = await record_experiment(finished, _experiment_memory(args))
+
+    if args.json:
+        print(finished.model_dump_json(indent=2))
+    else:
+        _print_experiment_report(finished, goal=goal)
+        if stored:
+            print(f"  memories    : {len(stored)} stored "
+                  "(episodic + procedural on success)")
+    evaluation = finished.evaluation
+    if evaluation is None or evaluation.verdict.value == "error":
+        return 1
+    return 0
+
+
+def _print_experiment_report(experiment: Any, *, goal: str = "") -> None:
+    comparison = experiment.comparison
+    evaluation = experiment.evaluation
+    print(f"SKYNET experiment {experiment.id[:12]}  [{experiment.status.value}]")
+    if goal:
+        print(f"  goal        : {goal}")
+    print(f"  hypothesis  : {experiment.hypothesis.statement}")
+    print(
+        f"  arms        : {experiment.baseline.ref} (baseline) vs "
+        f"{experiment.candidate.ref} (candidate), "
+        f"{experiment.trials} trials each, seed={experiment.seed}"
+    )
+    print("  criteria    : "
+          + "; ".join(c.description for c in experiment.success_criteria))
+    if comparison is not None:
+        print(f"  baseline    : {comparison.baseline.ref} mean {comparison.baseline.mean}")
+        print(f"  candidate   : {comparison.candidate.ref} mean {comparison.candidate.mean}")
+        for metric, delta in comparison.delta.items():
+            rel = comparison.relative.get(metric)
+            rel_text = f" ({rel:+.1%})" if rel is not None else ""
+            print(f"    - {metric}: {delta:+.4g}{rel_text}")
+        if comparison.improvements:
+            print(f"  improved    : {', '.join(comparison.improvements)}")
+        if comparison.regressions:
+            print(f"  regressed   : {', '.join(comparison.regressions)}")
+        print("  note        : descriptive comparison; no significance test performed")
+    if evaluation is not None:
+        print(f"  verdict     : {evaluation.verdict.value.upper()} — {evaluation.explanation}")
+        for result in evaluation.criteria_results:
+            measured = result.get("measured")
+            measured_text = f" measured={measured}" if measured is not None else ""
+            detail = result.get("detail")
+            detail_text = f" ({detail})" if detail else ""
+            print(
+                f"    - [{result['outcome']}] {result['criterion']}"
+                f"{measured_text}{detail_text}"
+            )
+        for line in evaluation.evidence:
+            print(f"    · {line}")
+    if experiment.error:
+        print(f"  error       : {experiment.error}")
+
+
+def _print_experiment_detail(experiment: Any) -> None:
+    _print_experiment_report(experiment)
+    print(f"  environment : {experiment.environment}")
+    print(f"  created     : {experiment.created_at:%Y-%m-%d %H:%M:%S} UTC")
+    if experiment.started_at and experiment.completed_at:
+        seconds = (experiment.completed_at - experiment.started_at).total_seconds()
+        print(f"  duration    : {seconds:.2f}s")
+    for trial in experiment.trials_results:
+        marker = "ok" if trial.success else f"FAILED: {trial.error}"
+        print(
+            f"    trial [{trial.arm}/{trial.index}] {marker} "
+            f"{trial.metrics} ({trial.duration_ms} ms)"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -218,6 +218,27 @@ class SkynetSettings(BaseSettings):
         description="Total character budget for memories injected into planning context.",
     )
 
+    # -- Experimentation (agency.experiments, Phase P6) ---------------------------
+    #: Experiments compare *registered strategy artifacts* through a sandbox;
+    #: they can never reference or modify source code. Actions ride the dark
+    #: ``enable_self_improvement`` gate (category 'lab').
+    experiments_registry_path: str = Field(
+        default="data/experiments.jsonl",
+        description="JSONL file where experiment history is persisted.",
+    )
+    experiment_default_trials: int = Field(
+        default=3, ge=1, le=100,
+        description="Default number of trials per arm when an experiment omits it.",
+    )
+    experiment_per_trial_timeout_seconds: float = Field(
+        default=60.0, ge=0.1, le=3600.0,
+        description="Default per-trial wall-clock timeout.",
+    )
+    experiment_max_total_seconds: float = Field(
+        default=600.0, ge=1.0, le=86_400.0,
+        description="Default total wall-clock budget for one experiment.",
+    )
+
     @property
     def web_blocked_host_set(self) -> frozenset[str]:
         return frozenset(

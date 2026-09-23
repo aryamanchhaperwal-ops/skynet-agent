@@ -35,6 +35,14 @@ from agency.experience import (
     ExperienceSink,
     InMemoryExperienceSink,
 )
+from agency.experiments.actions import (
+    ExperimentInspectAction,
+    ExperimentListAction,
+    ExperimentRunAction,
+)
+from agency.experiments.experiments_store import ExperimentRegistry
+from agency.experiments.registry import StrategyRegistry
+from agency.experiments.runner import ExperimentRunner
 from agency.goals import GoalManager
 from agency.intelligence import (
     IntelligenceService,
@@ -109,6 +117,14 @@ class CommsStack(NamedTuple):
     registry: AIProviderRegistry
     manager: ConversationManager
     comparison: ComparisonService
+
+
+class LabStack(NamedTuple):
+    """The experimentation pieces, exposed for wiring and testing."""
+
+    strategies: StrategyRegistry
+    experiments: ExperimentRegistry
+    runner: ExperimentRunner
 
 
 def build_web_stack(settings: SkynetSettings) -> WebStack:
@@ -211,6 +227,29 @@ def build_memory_stack(settings: SkynetSettings) -> MemoryStack:
     return MemoryStack(manager=manager)
 
 
+def build_lab_stack(
+    settings: SkynetSettings,
+    *,
+    strategy_registry: StrategyRegistry | None = None,
+    services: dict[str, object] | None = None,
+    memory: MemoryManager | None = None,
+) -> LabStack:
+    """Assemble the experimentation stack from settings.
+
+    ``strategy_registry`` (optional) injects pre-registered strategies —
+    used by tests and the demo; by default an empty registry is created
+    and only explicitly registered strategies can ever run. ``services``
+    is the sandbox's explicitly-injected capability map. Kept separate
+    from ``build_core`` so tests can build the lab without a full core.
+    """
+    strategies = strategy_registry or StrategyRegistry()
+    experiments = ExperimentRegistry(settings.experiments_registry_path)
+    runner = ExperimentRunner(strategies, services=services)
+    return LabStack(
+        strategies=strategies, experiments=experiments, runner=runner
+    )
+
+
 def build_llm_evaluator(service: IntelligenceService) -> Evaluator:
     """Build the LLM-backed evaluator (kept separate for test injection)."""
     from agency.intelligence.evaluator import LLMEvaluator
@@ -282,6 +321,14 @@ def build_core(
         register_action(registry, AIListParticipantsAction(comms.manager), settings)
         register_action(registry, AIAskAction(comms.manager), settings)
         register_action(registry, AICompareAction(comms.manager, comms.comparison), settings)
+
+    # -- Experimentation actions (flag-gated, category 'lab') -------------------
+    if settings.enable_self_improvement:
+        lab = build_lab_stack(settings, memory=memory)
+        run_action = ExperimentRunAction(lab.runner, lab.experiments, memory=memory)
+        register_action(registry, run_action, settings)
+        register_action(registry, ExperimentListAction(lab.experiments), settings)
+        register_action(registry, ExperimentInspectAction(lab.experiments), settings)
 
     # -- Perception -------------------------------------------------------------
     session_for_perception = session_factory if database_enabled else None

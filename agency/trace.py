@@ -70,6 +70,22 @@ class TraceEventType(StrEnum):
     # counts, never full memory bodies (those live in the memory store).
     MEMORY_RECALLED = "MEMORY_RECALLED"
     MEMORY_STORED = "MEMORY_STORED"
+    # -- Experimentation (Phase P6) ---------------------------------------------
+    # Emitted by ``agency.experiments`` through the run's ``Trace`` facade;
+    # payloads carry experiment/trial ids and metric values only.
+    EXPERIMENT_CREATED = "EXPERIMENT_CREATED"
+    EXPERIMENT_STARTED = "EXPERIMENT_STARTED"
+    TRIAL_STARTED = "TRIAL_STARTED"
+    TRIAL_COMPLETED = "TRIAL_COMPLETED"
+    TRIAL_FAILED = "TRIAL_FAILED"
+    METRIC_RECORDED = "METRIC_RECORDED"
+    BASELINE_MEASURED = "BASELINE_MEASURED"
+    CANDIDATE_MEASURED = "CANDIDATE_MEASURED"
+    EXPERIMENT_COMPARED = "EXPERIMENT_COMPARED"
+    EXPERIMENT_EVALUATED = "EXPERIMENT_EVALUATED"
+    EXPERIMENT_COMPLETED = "EXPERIMENT_COMPLETED"
+    EXPERIMENT_FAILED = "EXPERIMENT_FAILED"
+    EXPERIMENT_CANCELLED = "EXPERIMENT_CANCELLED"
 
 
 class TraceEvent(BaseModel):
