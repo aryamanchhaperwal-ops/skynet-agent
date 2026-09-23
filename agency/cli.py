@@ -290,6 +290,63 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Where experiment memories are recorded (sqlite persists across runs).",
     )
     exp_demo.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    # -- Self-improvement (agency.improve, Phase P7) --------------------------------
+    improve = subparsers.add_parser(
+        "improve",
+        help="Detect weaknesses, propose improvements, test, approve, "
+        "apply, roll back and monitor (offline demo included).",
+    )
+    improve_sub = improve.add_subparsers(dest="improve_command", required=True)
+
+    imp_detect = improve_sub.add_parser(
+        "detect",
+        help="Detect weaknesses from recorded experiences and experiment history.",
+    )
+    imp_detect.add_argument(
+        "--memory-backend",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Memory backend for weakness persistence (sqlite persists).",
+    )
+    imp_detect.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    imp_propose = improve_sub.add_parser(
+        "propose", help="Build hypothesis + proposal + candidate for one weakness."
+    )
+    imp_propose.add_argument("weakness_id", help="Weakness id (from improve detect).")
+    imp_propose.add_argument(
+        "--origin",
+        choices=("internal", "external"),
+        default="internal",
+        help="Internal detection or an external (web/AI) suggestion (same gates).",
+    )
+    imp_propose.add_argument(
+        "--param",
+        action="append",
+        default=None,
+        help="Candidate config key=value (repeatable), e.g. --param max_results=8.",
+    )
+    imp_propose.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    improve_sub.add_parser(
+        "history",
+        help="List recorded proposals (have I attempted this before?).",
+    ).add_argument("--json", action="store_true", help="Print only JSON.")
+
+    improve_sub.add_parser(
+        "demo",
+        help="Run the built-in end-to-end offline demonstration: detect → "
+        "propose → test → evaluate → approve → apply → monitor → rollback.",
+    )
+    imp_demo = improve_sub.choices["demo"]  # type: ignore[index]
+    imp_demo.add_argument(
+        "--memory-backend",
+        choices=("memory", "sqlite"),
+        default=None,
+        help="Where improvement memories are recorded (sqlite persists).",
+    )
+    imp_demo.add_argument("--json", action="store_true", help="Print only JSON.")
     return parser
 
 
@@ -308,6 +365,8 @@ async def _run(args: argparse.Namespace) -> int:
         return await _run_memory_stats(args)
     if getattr(args, "command", None) == "experiment":
         return await _run_experiment(args)
+    if getattr(args, "command", None) == "improve":
+        return await _run_improve(args)
     return await _run_goal(args)
 
 
@@ -1013,6 +1072,175 @@ def _print_experiment_detail(experiment: Any) -> None:
             f"    trial [{trial.arm}/{trial.index}] {marker} "
             f"{trial.metrics} ({trial.duration_ms} ms)"
         )
+
+
+# -- Self-improvement (agency.improve, Phase P7) ----------------------------------
+
+
+def _improve_memory(args: argparse.Namespace):
+    """Memory manager for improvement recording (backend per operator flag)."""
+    from agency.bootstrap import build_memory_stack
+
+    if not getattr(args, "memory_backend", None):
+        return None
+    updates: dict[str, Any] = {"memory_backend": args.memory_backend}
+    return build_memory_stack(SkynetSettings(**updates)).manager
+
+
+def _build_improve_pipeline(args: argparse.Namespace):
+    """Lab pipeline wired from settings + demo corpus for offline detection."""
+    from agency.bootstrap import build_lab_stack
+    from agency.experiments.demo import _CORPUS
+
+    settings = SkynetSettings()
+    memory = _improve_memory(args)
+    stack = build_lab_stack(
+        settings,
+        memory=memory,
+        services={"search_corpus": _CORPUS},
+    )
+    return stack.improvement
+
+
+async def _run_improve_detect(args: argparse.Namespace) -> int:
+    """Detect weaknesses from recorded history (experiences + experiments)."""
+    from agency.experiments.experiments_store import ExperimentRegistry
+    from agency.improve.detector import DetectorInput
+
+    pipeline = _build_improve_pipeline(args)
+    # Experiences: the operator's recorded run history (database backend in
+    # production). The CLI works offline, so the experiments registry —
+    # real persisted experiment history — is the data source here.
+    experiments_store = ExperimentRegistry(SkynetSettings().experiments_registry_path)
+    all_experiments = []
+    for summary in await experiments_store.list(limit=100):
+        record = await experiments_store.get(summary.id)
+        if record is not None:
+            all_experiments.append(record)
+    detected = await pipeline.detect(
+        DetectorInput(experiments=all_experiments)
+    )
+    known = pipeline.list_weaknesses()
+    if args.json:
+        print(json.dumps({"detected": len(detected), "known": len(known)}))
+        return 0
+    print(f"weaknesses detected: {len(detected)} (total known: {len(known)})")
+    for weakness in known:
+        print(
+            f"  - [{weakness.severity:.2f}] {weakness.category.value} "
+            f"({weakness.status.value}) freq={weakness.frequency} id={weakness.id[:12]}"
+        )
+        print(f"      {weakness.description}")
+        print(f"      component: {weakness.affected_component or 'n/a'}")
+    return 0
+
+
+async def _run_improve_propose(args: argparse.Namespace) -> int:
+    from agency.improve.pipeline import build_proposal_artifacts  # noqa: F401
+
+    pipeline = _build_improve_pipeline(args)
+    config: dict[str, Any] = {}
+    for pair in args.param or []:
+        key, _, raw = pair.partition("=")
+        value: Any = raw
+        if raw.lower() in {"true", "false"}:
+            value = raw.lower() == "true"
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+        config[key.strip()] = value
+    try:
+        hypothesis, proposal, candidate = await pipeline.propose(
+            args.weakness_id,
+            origin=args.origin,
+            candidate_config=config,
+        )
+    except KeyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "hypothesis_id": hypothesis.id,
+                    "proposal_id": proposal.id,
+                    "candidate_ref": candidate.ref,
+                    "statement": hypothesis.statement,
+                }
+            )
+        )
+        return 0
+    print(f"SKYNET proposal {proposal.id[:12]}  [{proposal.status.value}]")
+    print(f"  weakness    : {proposal.weakness_id[:12]}")
+    print(f"  hypothesis  : {hypothesis.statement}")
+    print(f"  target      : {proposal.target} -> {candidate.ref}")
+    print(f"  change      : {proposal.proposed_change}")
+    print("  criteria    : " + "; ".join(c.description for c in proposal.acceptance_criteria))
+    print("  rollback    : " + proposal.rollback_plan)
+    if proposal.metadata.get("prior_attempts"):
+        print(
+            f"  prior tries : {len(proposal.metadata['prior_attempts'])} "
+            "(see improve history)"
+        )
+    return 0
+
+
+async def _run_improve_history(args: argparse.Namespace) -> int:
+    pipeline = _build_improve_pipeline(args)
+    proposals = pipeline.proposals()
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": p.id,
+                        "status": p.status.value,
+                        "decision": p.decision,
+                        "target": p.target,
+                        "candidate": p.candidate_ref,
+                        "reason": p.decision_reason,
+                    }
+                    for p in proposals
+                ]
+            )
+        )
+        return 0
+    if not proposals:
+        print("no improvement proposals recorded")
+        return 0
+    print(f"improvement proposals: {len(proposals)}")
+    for p in proposals:
+        decision = p.decision or "-"
+        print(
+            f"  - {p.id[:12]}  [{p.status.value}]  {p.target} vs "
+            f"{p.candidate_ref or '-'}  decision={decision}"
+        )
+        if p.decision_reason:
+            print(f"      reason: {p.decision_reason}")
+    return 0
+
+
+async def _run_improve(args: argparse.Namespace) -> int:
+    command = getattr(args, "improve_command", None)
+    if command == "detect":
+        return await _run_improve_detect(args)
+    if command == "propose":
+        return await _run_improve_propose(args)
+    if command == "history":
+        return await _run_improve_history(args)
+    if command == "demo":
+        from agency.improve.demo import run_demo
+
+        return await run_demo(
+            memory_backend=args.memory_backend, as_json=args.json
+        )
+    print(f"error: unknown improve command {command!r}", file=sys.stderr)
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:

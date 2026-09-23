@@ -44,6 +44,14 @@ from agency.experiments.experiments_store import ExperimentRegistry
 from agency.experiments.registry import StrategyRegistry
 from agency.experiments.runner import ExperimentRunner
 from agency.goals import GoalManager
+from agency.improve.actions import (
+    ImproveHistoryAction,
+    ImproveInspectAction,
+    ImproveProposeAction,
+)
+from agency.improve.detector import DetectorThresholds, WeaknessDetector
+from agency.improve.pipeline import ImprovementPipeline
+from agency.improve.store import ImprovementStore
 from agency.intelligence import (
     IntelligenceService,
     LLMPlanner,
@@ -120,11 +128,12 @@ class CommsStack(NamedTuple):
 
 
 class LabStack(NamedTuple):
-    """The experimentation pieces, exposed for wiring and testing."""
+    """The experimentation + self-improvement pieces, exposed for wiring."""
 
     strategies: StrategyRegistry
     experiments: ExperimentRegistry
     runner: ExperimentRunner
+    improvement: ImprovementPipeline
 
 
 def build_web_stack(settings: SkynetSettings) -> WebStack:
@@ -233,8 +242,10 @@ def build_lab_stack(
     strategy_registry: StrategyRegistry | None = None,
     services: dict[str, object] | None = None,
     memory: MemoryManager | None = None,
+    improvement_store: ImprovementStore | None = None,
+    emit: object | None = None,
 ) -> LabStack:
-    """Assemble the experimentation stack from settings.
+    """Assemble the experimentation + self-improvement stack from settings.
 
     ``strategy_registry`` (optional) injects pre-registered strategies —
     used by tests and the demo; by default an empty registry is created
@@ -245,8 +256,28 @@ def build_lab_stack(
     strategies = strategy_registry or StrategyRegistry()
     experiments = ExperimentRegistry(settings.experiments_registry_path)
     runner = ExperimentRunner(strategies, services=services)
+    store = improvement_store or ImprovementStore(settings.improvements_registry_path)
+    detector = WeaknessDetector(
+        DetectorThresholds(
+            min_frequency=settings.improvement_min_frequency,
+            low_score=settings.improvement_low_score_threshold,
+            duplicate_rate=settings.improvement_duplicate_rate_threshold,
+        )
+    )
+    pipeline = ImprovementPipeline(
+        strategies=strategies,
+        runner=runner,
+        experiments=experiments,
+        memory=memory,
+        emit=emit,
+        store=store,
+        detector=detector,
+    )
     return LabStack(
-        strategies=strategies, experiments=experiments, runner=runner
+        strategies=strategies,
+        experiments=experiments,
+        runner=runner,
+        improvement=pipeline,
     )
 
 
@@ -322,13 +353,16 @@ def build_core(
         register_action(registry, AIAskAction(comms.manager), settings)
         register_action(registry, AICompareAction(comms.manager, comms.comparison), settings)
 
-    # -- Experimentation actions (flag-gated, category 'lab') -------------------
+    # -- Experimentation + self-improvement actions (flag-gated, 'lab') ----------
     if settings.enable_self_improvement:
         lab = build_lab_stack(settings, memory=memory)
         run_action = ExperimentRunAction(lab.runner, lab.experiments, memory=memory)
         register_action(registry, run_action, settings)
         register_action(registry, ExperimentListAction(lab.experiments), settings)
         register_action(registry, ExperimentInspectAction(lab.experiments), settings)
+        register_action(registry, ImproveProposeAction(lab.improvement), settings)
+        register_action(registry, ImproveInspectAction(lab.improvement), settings)
+        register_action(registry, ImproveHistoryAction(lab.improvement), settings)
 
     # -- Perception -------------------------------------------------------------
     session_for_perception = session_factory if database_enabled else None

@@ -239,6 +239,36 @@ class SkynetSettings(BaseSettings):
         description="Default total wall-clock budget for one experiment.",
     )
 
+    # -- Self-improvement (agency.improve, Phase P7) --------------------------------
+    #: The improvement pipeline reuses the experiment engine above; these
+    #: settings govern detection sensitivity and history persistence only.
+    #: Everything still ships dark behind ``enable_self_improvement``.
+    improvements_registry_path: str = Field(
+        default="data/improvements.jsonl",
+        description="JSONL file where weakness/proposal/version history is persisted.",
+    )
+    improvement_min_frequency: int = Field(
+        default=2, ge=1, le=1000,
+        description="Minimum recurring records before the detector reports a weakness.",
+    )
+    improvement_low_score_threshold: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+        description="Evaluation scores below this count toward the low-evaluation weakness.",
+    )
+    improvement_duplicate_rate_threshold: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Candidate-arm duplicate_rate at or above this is a weakness.",
+    )
+    improvement_max_acceptance_trials: int = Field(
+        default=3, ge=1, le=100,
+        description="Trials per arm used by improvement experiments by default.",
+    )
+    improvement_auto_rollback: bool = Field(
+        default=False,
+        description="When true, post-deployment regressions below the rollback floor "
+        "trigger rollback automatically; otherwise only the event is recorded.",
+    )
+
     @property
     def web_blocked_host_set(self) -> frozenset[str]:
         return frozenset(

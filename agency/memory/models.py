@@ -42,6 +42,8 @@ MemoryOrigin = Literal[
     "experience",
     "conversation",
     "research",
+    "experiment",
+    "improvement",
     "human",
     "consolidation",
     "system",

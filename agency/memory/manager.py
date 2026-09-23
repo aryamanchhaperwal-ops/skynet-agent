@@ -26,6 +26,8 @@ _ALLOWED_ORIGINS = frozenset(
         "experience",
         "conversation",
         "research",
+        "experiment",
+        "improvement",
         "human",
         "consolidation",
         "system",
