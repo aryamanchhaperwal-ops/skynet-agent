@@ -188,6 +188,10 @@ class AutonomousRun(BaseModel):
     proposal_ids: list[str] = Field(default_factory=list)
     #: Active strategy versions at run start (audit; never mutated here).
     active_versions: dict[str, str] = Field(default_factory=dict)
+    #: Security findings from scanning external content (web pages, AI
+    #: responses) before they influenced the run. Directive-like fragments
+    #: are recorded here as DATA — never executed, never acted upon.
+    security_report: dict[str, Any] = Field(default_factory=dict)
     budgets: OrchestratorBudgets = Field(default_factory=OrchestratorBudgets)
     #: Actual usage counters the budgets check.
     usage: dict[str, float] = Field(

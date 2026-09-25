@@ -27,6 +27,7 @@ Design invariants:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -49,6 +50,46 @@ from agency.orchestrator.state_machine import InvalidTransitionError, require_tr
 from agency.orchestrator.store import RunStore
 
 logger = logging.getLogger("skynet.orchestrator")
+
+
+def _extract_search_query(answer: str) -> str:
+    """Pull a usable web-search query out of a model's free-text proposal.
+
+    Models routinely wrap the query in prose ("Web search query: \"…\"").
+    A verbatim prose sentence is a poor search query — search engines
+    return few/no hits for it — so extract a short quoted/backticked
+    fragment or a labeled value when present, else fall back to the first
+    sentence. Returns "" when nothing usable remains.
+    """
+    text = (answer or "").strip()
+    if not text:
+        return ""
+    # Models emit smart quotes; normalize so quoted fragments match.
+    text = (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+    for pattern in (
+        r'"([^"]{3,120}?)"',      # "..." fragment
+        r"`([^`\n]{3,120}?)`",     # `...` fragment
+        r"query\s*[:=]\s*(.+$)",   # "query: ..." label, case-insensitive
+    ):
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            candidate = match.group(1).strip().strip("\"'`").strip().strip(".,;:")
+            if 3 <= len(candidate) <= 120:
+                return candidate
+    first_sentence = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0].strip()
+    # Strip labels the model may have prefixed ("Proposed query: ...").
+    first_sentence = re.sub(
+        r"^(?:proposed\s+|search\s+|web\s+)*query\s*[:=]\s*",
+        "",
+        first_sentence,
+        flags=re.IGNORECASE,
+    ).strip("\"'` ")
+    return first_sentence[:120]
 
 
 class OrchestratorError(RuntimeError):
@@ -92,6 +133,81 @@ class AutonomousOrchestrator:
     async def _save(self, run: AutonomousRun) -> None:
         run.touch()
         await self._store.save(run)
+
+    def _collect_security_report(self, run: AutonomousRun) -> None:
+        """Record directive-like fragments found in external content.
+
+        Findings are DATA on the run record (and one trace event per batch):
+        they never change control flow, configuration or policy. The
+        orchestrator treats them as telemetry about untrusted input.
+        """
+        found = 0
+        for item in run.evidence:
+            flags = item.provenance.get("security_flags") or []
+            analysis = item.provenance.get("analysis_directives") or []
+            hits = list(flags) + list(analysis)
+            if hits:
+                found += len(hits)
+                run.security_report.setdefault("findings", []).append(
+                    {
+                        "evidence_id": item.id,
+                        "source_type": item.source_type,
+                        "source": item.source,
+                        "matches": hits,
+                        "recorded_at": item.provenance.get("retrieved_at", ""),
+                    }
+                )
+        if found:
+            run.security_report["total_flags"] = int(
+                run.security_report.get("total_flags", 0)
+            ) + found
+            run.security_report["status"] = "CONTENT_TREATED_AS_UNTRUSTED_DATA"
+
+    async def _trace_llm_request(
+        self,
+        run: AutonomousRun,
+        coro: Any,
+        *,
+        purpose: str,
+    ) -> Any:
+        """Await one LLM call, emitting request lifecycle events.
+
+        The LLM is invoked through the existing planner/evaluator seam —
+        this wrapper only adds observability around it (payloads carry
+        provider/model/latency, never message bodies or credentials).
+        """
+        service = getattr(self._core, "_intelligence", None)
+        info = service.info() if service is not None else {}
+        await self._trace(
+            "LLM_REQUEST_STARTED",
+            run_id=run.id,
+            purpose=purpose,
+            provider=info.get("provider", ""),
+            model=info.get("model", ""),
+        )
+        started = time.perf_counter()
+        try:
+            result = await coro
+        except Exception as exc:
+            await self._trace(
+                "LLM_REQUEST_FAILED",
+                run_id=run.id,
+                purpose=purpose,
+                error=f"{type(exc).__name__}: {exc}"[:200],
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+            raise
+        usage = run.usage
+        usage["ai_requests"] = usage.get("ai_requests", 0.0) + 1
+        await self._trace(
+            "LLM_REQUEST_COMPLETED",
+            run_id=run.id,
+            purpose=purpose,
+            provider=info.get("provider", ""),
+            model=info.get("model", ""),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return result
 
     def _budget_decision(self, run: AutonomousRun) -> BudgetDecision:
         usage = run.usage
@@ -311,8 +427,19 @@ class AutonomousOrchestrator:
                             source_type="memory",
                             content=(record.summary or record.content)[:500],
                             confidence=record.confidence or 0.5,
-                            provenance={"memory_id": record.id, "type": record.type.value},
+                            provenance={
+                                "memory_id": record.id,
+                                "type": record.type.value,
+                                "evidence_class": "MEMORY",
+                            },
                         )
+                    )
+                    await self._trace(
+                        "OBSERVATION_RECORDED",
+                        run_id=run.id,
+                        source=f"memory:{record.id[:12]}",
+                        source_type="memory",
+                        evidence_class="MEMORY",
                     )
                 if recalled:
                     await self._trace(
@@ -328,6 +455,7 @@ class AutonomousOrchestrator:
         plan = run.plan
         plan.iteration = run.iteration
         plan.focus = plan.focus or run.objective
+        prior_queries = list(plan.research_queries)
         # Deterministic refinement from accumulated evidence: queries target
         # what is not yet covered (spec §6: revise the plan on new evidence).
         if run.iteration > 0:
@@ -337,6 +465,53 @@ class AutonomousOrchestrator:
         configured_questions = run.configuration.get("ai_questions")
         if isinstance(configured_questions, list):
             plan.ai_questions = [str(q) for q in configured_questions if str(q).strip()]
+        # Real-LLM plan proposal: when the core runs an LLM planner (and no
+        # explicit steps/queries are configured — those always win), let the
+        # model propose the query here, with the deterministic text as
+        # fallback. Re-fires on replan iterations so a new iteration can
+        # target what previous evidence left uncovered. One observable
+        # request per plan stage, one failure-recovery path, no retries.
+        intelligence = getattr(self._core, "_intelligence", None)
+        configured_queries = run.configuration.get("research_queries")
+        if isinstance(configured_queries, list) and configured_queries:
+            plan.research_queries = [str(q) for q in configured_queries if str(q).strip()]
+        elif (
+            intelligence is not None
+            and not run.configuration.get("core_goal_params")
+            and not configured_queries
+        ):
+            prompt = (
+                "Propose one concise web search query for this objective, then "
+                "justify it in one sentence.\n"
+                f"Objective: {run.objective}\n"
+                f"Focus: {plan.focus}"
+            )
+            if prior_queries:
+                prompt += (
+                    "\nPrior queries already searched: "
+                    + "; ".join(prior_queries[:5])
+                    + "\nPropose a query covering a DIFFERENT aspect of the objective."
+                )
+            answer = await self._trace_llm_request(
+                run,
+                intelligence.generate(
+                    "You are a research planner. Be terse and concrete.",
+                    prompt,
+                    max_tokens=260,
+                    metadata={"purpose": "autonomous_plan"},
+                ),
+                purpose="plan",
+            )
+            if answer:
+                query = _extract_search_query(answer)
+                if query:
+                    run.plan.research_queries = [query]
+                else:
+                    run.add_error(
+                        "llm plan proposal unusable; using deterministic queries"
+                    )
+            else:
+                run.add_error("llm plan proposal failed; using deterministic queries")
         await self._trace(
             "AUTONOMOUS_PLAN_CREATED",
             run_id=run.id,
@@ -357,6 +532,12 @@ class AutonomousOrchestrator:
         queries = run.plan.research_queries[:remaining_web]
         gathered = 0
         for query in queries:
+            await self._trace(
+                "RESEARCH_STARTED",
+                run_id=run.id,
+                query=query,
+                adapter=type(self._research).__name__,
+            )
             try:
                 found = await self._research.search(
                     query, max_results=3, run_id=run.id
@@ -365,15 +546,45 @@ class AutonomousOrchestrator:
                 run.add_error(f"research failed for {query!r}: {exc}")
                 continue
             run.usage["web_requests"] = run.usage.get("web_requests", 0.0) + 1
+            # Some backends (e.g. Wikipedia's keyword search) return nothing
+            # for keyword-poor, punctuation-heavy queries. One budget-counted
+            # simplified retry — first search terms only, punctuation
+            # stripped — keeps the loop moving without fabricating results.
+            if not found and remaining_web - int(
+                run.usage.get("web_requests", 0.0)
+            ) > 0:
+                simplified = re.sub(r"[^\w\s-]", " ", query)
+                simplified = " ".join(simplified.split()[:5])
+                if simplified and simplified.lower() != query.lower():
+                    try:
+                        found = await self._research.search(
+                            simplified, max_results=3, run_id=run.id
+                        )
+                    except Exception as exc:
+                        run.add_error(
+                            f"research retry failed for {simplified!r}: {exc}"
+                        )
+                        found = []
+                    run.usage["web_requests"] = run.usage.get("web_requests", 0.0) + 1
             for item in found:
                 run.evidence.append(item)
                 gathered += 1
+                await self._trace(
+                    "SOURCE_RETRIEVED",
+                    run_id=run.id,
+                    source=item.source,
+                    source_type=item.source_type,
+                    evidence_class=item.provenance.get("evidence_class", ""),
+                    retrieved_at=item.provenance.get("retrieved_at", ""),
+                    security_flags=item.provenance.get("security_flags", []),
+                )
         await self._trace(
             "AUTONOMOUS_RESEARCH_COMPLETED",
             run_id=run.id,
             queries=len(queries),
             evidence=gathered,
         )
+        self._collect_security_report(run)
         if run.plan.ai_questions and run.budgets.max_ai_requests > 0:
             return RunStage.COMMUNICATE
         return RunStage.ACT
@@ -391,6 +602,7 @@ class AutonomousOrchestrator:
             if answer is not None:
                 run.evidence.append(answer)
                 asked += 1
+        self._collect_security_report(run)
         await self._trace(
             "AUTONOMOUS_COMMUNICATION_COMPLETED",
             run_id=run.id,
@@ -445,6 +657,7 @@ class AutonomousOrchestrator:
             run.add_error(
                 f"core run {summary.run_id[:12]} did not pass: {summary.status}"
             )
+        self._collect_security_report(run)
         # Evidence from the core run's synthesized result.
         result_payload = summary.result or {}
         if result_payload.get("summary"):
@@ -454,8 +667,21 @@ class AutonomousOrchestrator:
                     source_type="action",
                     content=str(result_payload["summary"])[:500],
                     confidence=0.7 if summary.ok else 0.3,
-                    provenance={"core_run_id": summary.run_id, "actions": len(summary.actions)},
+                    provenance={
+                        "core_run_id": summary.run_id,
+                        "actions": len(summary.actions),
+                        "evidence_class": "EXPERIMENTAL_RESULT" if any(
+                            "experiment" in str(getattr(a, "type", "")) for a in summary.actions
+                        ) else "MODEL_GENERATED_CONTENT",
+                    },
                 )
+            )
+            await self._trace(
+                "OBSERVATION_RECORDED",
+                run_id=run.id,
+                source=f"core_run:{summary.run_id[:12]}",
+                source_type="action",
+                evidence_class=run.evidence[-1].provenance["evidence_class"],
             )
         return RunStage.EVALUATE
 
@@ -484,7 +710,10 @@ class AutonomousOrchestrator:
         elif enough:
             decision = StageDecision(
                 action="research_more",
-                reason=f"only {len(external)} external item(s); need ≥ 3",
+                reason=(
+                    f"agent cycle did not pass; {len(external)} external "
+                    "evidence item(s) gathered"
+                ),
                 next_focus=run.plan.focus,
             )
         else:

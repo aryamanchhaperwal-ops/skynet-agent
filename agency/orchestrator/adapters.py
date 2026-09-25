@@ -20,9 +20,11 @@ without embedding provider logic in the orchestrator.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from agency.orchestrator.models import Evidence
+from agency.orchestrator.security import scan_content
 
 logger = logging.getLogger("skynet.orchestrator.adapters")
 
@@ -76,6 +78,10 @@ class LocalResearchAdapter:
                     "adapter": "local_corpus",
                     "title": pages[url].get("title", ""),
                     "query": query,
+                    # Injected corpus, not a live source: the evaluator
+                    # must never confuse test data with live retrieval.
+                    "evidence_class": "LOCAL_TEST_DATA",
+                    "retrieved_at": datetime.now(UTC).isoformat(),
                 },
             )
             for url in urls
@@ -107,7 +113,12 @@ class LocalCommsAdapter:
             source_type="ai",
             content=text[:2000],
             confidence=0.3,  # placeholder opinions stay low-confidence
-            provenance={"adapter": "local_mock", "question": question},
+            provenance={
+                "adapter": "local_mock",
+                "question": question,
+                "evidence_class": "MODEL_GENERATED_CONTENT",
+                "retrieved_at": datetime.now(UTC).isoformat(),
+            },
         )
 
     async def available(self) -> list[str]:
@@ -123,6 +134,9 @@ class WebResearchAdapter:
     def __init__(self, research_service: Any, max_chars: int = 2000) -> None:
         self._service = research_service
         self._max_chars = max_chars
+        #: Search-provider name for provenance (``ResearchService`` keeps it
+        #: private; this is filled by the factory from settings).
+        self.provider_name: str = ""
 
     async def search(
         self, query: str, *, max_results: int, run_id: str
@@ -134,19 +148,34 @@ class WebResearchAdapter:
             return []
         evidence: list[Evidence] = []
         sources = getattr(package, "sources", None) or []
+        fetched_at = datetime.now(UTC).isoformat()
         for source in sources[:max_results]:
+            # ``ExtractedContent`` carries the page text in ``text``
+            # (``extract`` was never a real field).
+            content = (getattr(source, "text", "") or "")[: self._max_chars]
+            # Directive-like fragments in the page are recorded, never run:
+            # content stays DATA regardless of what it asks Skynet to do.
+            directives = scan_content(content)
+            provenance: dict[str, Any] = {
+                "adapter": "web",
+                "query": query,
+                "run_id": run_id,
+                "title": getattr(source, "title", ""),
+                # Live retrieval classification + audit trail.
+                "evidence_class": "LIVE_EXTERNAL_EVIDENCE",
+                "provider": self.provider_name,
+                "url": getattr(source, "url", "") or getattr(source, "final_url", ""),
+                "retrieved_at": fetched_at,
+            }
+            if directives:
+                provenance["security_flags"] = directives
             evidence.append(
                 Evidence(
                     source=getattr(source, "url", "") or str(source),
                     source_type="web",
-                    content=(getattr(source, "extract", "") or "")[: self._max_chars],
+                    content=content,
                     confidence=0.55,
-                    provenance={
-                        "adapter": "web",
-                        "query": query,
-                        "run_id": run_id,
-                        "title": getattr(source, "title", ""),
-                    },
+                    provenance=provenance,
                 )
             )
         return evidence
@@ -154,6 +183,9 @@ class WebResearchAdapter:
 
 class CommsCommsAdapter:
     """Real AI↔AI communication via the P5 ConversationManager."""
+
+    #: Trace hook set by the orchestrator (optional): async (event, **payload).
+    emit: Any = None
 
     def __init__(self, manager: Any) -> None:
         self._manager = manager
@@ -186,6 +218,18 @@ class CommsCommsAdapter:
         turns = getattr(outcome, "turns", None) or []
         if not turns:
             return None
+        if self.emit is not None:
+            try:
+                await self.emit(
+                    "OBSERVATION_RECORDED",
+                    run_id=run_id,
+                    source="comms",
+                    source_type="ai",
+                    evidence_class="MODEL_GENERATED_CONTENT",
+                    participant=participants[0],
+                )
+            except Exception:  # pragma: no cover - observability must not break the run
+                logger.exception("comms adapter trace emission failed")
         first = turns[0]
         conversation = getattr(outcome, "conversation", None)
         return Evidence(
@@ -199,6 +243,11 @@ class CommsCommsAdapter:
                 "adapter": "comms",
                 "conversation_id": getattr(conversation, "id", None),
                 "turns": len(turns),
+                # Model output is a claim, not external evidence: the
+                # evaluator must never count it as a live source.
+                "evidence_class": "MODEL_GENERATED_CONTENT",
+                "provider": getattr(conversation, "provider", ""),
+                "retrieved_at": datetime.now(UTC).isoformat(),
                 # Directive-like fragments detected by the P5 security layer
                 # ride along as data — never executed (spec §18).
                 "analysis_directives": list(
@@ -217,7 +266,9 @@ def build_research_adapter(settings: Any) -> ResearchAdapter:
     from agency.bootstrap import build_web_stack
 
     stack = build_web_stack(settings)
-    return WebResearchAdapter(stack.service)
+    adapter = WebResearchAdapter(stack.service)
+    adapter.provider_name = str(getattr(settings, "search_provider", ""))
+    return adapter
 
 
 def build_comms_adapter(settings: Any) -> CommsAdapter:

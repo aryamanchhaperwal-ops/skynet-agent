@@ -302,6 +302,7 @@ def build_core(
     extra_actions: tuple[Action, ...] = (),
     extra_trace_sinks: tuple[TraceSink, ...] = (),
     memory: MemoryManager | None = None,
+    emit: object | None = None,
 ) -> SkynetCore:
     """Assemble a SkynetCore from settings.
 
@@ -394,7 +395,16 @@ def build_core(
             LLMPlanner(
                 service,  # type: ignore[arg-type] - guarded by use_llm_planner
                 fallback=deterministic_planner,
-                allowed_actions=frozenset(registry.names()),
+                # The planner must propose only actions the run may actually
+                # execute: the intersection of the configured allowlist
+                # (execution gate, loop._execute_step) and the actions
+                # actually registered for this assembly. An empty
+                # configuration means "allow all registered actions".
+                allowed_actions=(
+                    settings.action_allowlist & frozenset(registry.names())
+                    if settings.action_allowlist
+                    else frozenset(registry.names())
+                ),
                 max_steps=settings.max_steps_per_run,
             )
             if service is not None
@@ -415,8 +425,15 @@ def build_core(
     if database_enabled:
         trace_sinks.append(DatabaseTraceSink(session_factory))
     trace_sinks.extend(extra_trace_sinks)
+    if emit is not None:
+        # Caller-supplied async emit(event, **payload) hook (P9): the same
+        # facade the orchestrator traces through, so a real run's core
+        # cycles share one observable event stream.
+        from agency.trace import CallableTraceSink
 
-    return SkynetCore(
+        trace_sinks.append(CallableTraceSink(emit))
+
+    core = SkynetCore(
         settings=settings,
         storage=storage,
         goal_manager=GoalManager(storage),
@@ -428,6 +445,11 @@ def build_core(
         trace_sinks=trace_sinks,
         memory=memory,
     )
+    # Read-only observability seam (P9): expose the intelligence service on
+    # the core so the orchestrator can trace LLM request lifecycle events.
+    # ``None`` when the run is deterministic-only.
+    core._intelligence = service
+    return core
 
 
 def build_orchestrator(
@@ -454,7 +476,7 @@ def build_orchestrator(
     from agency.orchestrator.store import RunStore
 
     settings = settings or SkynetSettings()
-    core = core or build_core(settings, memory=memory)
+    core = core or build_core(settings, memory=memory, emit=emit)
     memory = memory or core.memory_manager
     pipeline = improvement_pipeline
     detector = None

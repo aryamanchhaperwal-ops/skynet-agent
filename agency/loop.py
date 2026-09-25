@@ -130,6 +130,9 @@ class SkynetCore:
         #: Optional long-term memory (Phase P2). ``None`` keeps the core
         #: memory-free (older tests, minimal deployments).
         self._memory = memory
+        #: Optional intelligence service handle (read-only seam for the
+        #: orchestrator's LLM observability; may be ``None``).
+        self._intelligence: Any = None
 
     # ------------------------------------------------------------------ API
 
@@ -142,6 +145,11 @@ class SkynetCore:
     def memory_manager(self) -> MemoryManager | None:
         """The long-term memory manager, if any (read-only seam)."""
         return self._memory
+
+    @property
+    def intelligence(self) -> Any:
+        """The intelligence service handle, if any (read-only seam)."""
+        return self._intelligence
 
     async def run_goal(self, spec: GoalSpec) -> RunSummary:
         """Run the full agent cycle for one goal. Never raises: failures

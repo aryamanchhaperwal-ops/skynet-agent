@@ -49,11 +49,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override SKYNET_MAX_STEPS_PER_RUN for this run.",
     )
     run.add_argument(
-        "--steps",
-        default=None,
-        help="Explicit plan as a JSON array of {\"type\", \"params\"} steps "
-        "(default: deterministic planner's built-in strategy).",
-    )
+    "--steps",
+    default=None,
+    help="Explicit plan as a JSON array of {\"type\", \"params\"} steps "
+    "(default: deterministic planner's built-in strategy).",
+)
     run.add_argument(
         "--memory-backend",
         choices=("memory", "sqlite"),
@@ -383,6 +383,86 @@ def _build_parser() -> argparse.ArgumentParser:
     aut_status = autonomous_sub.add_parser(
         "status", help="List autonomous runs and their current state."
     )
+
+    # -- Real capabilities (P9): provider health + bounded real objective ----- 
+    provider = subparsers.add_parser(
+        "provider",
+        help="Provider health checks for real LLM/web/comms capabilities.",
+    )
+    provider_sub = provider.add_subparsers(dest="provider_command", required=True)
+    prov_status = provider_sub.add_parser(
+        "status",
+        help="Classify every provider seam (REAL/LOCAL/MOCK/UNAVAILABLE) without "
+        "sending requests.",
+    )
+    prov_status.add_argument("--json", action="store_true", help="JSON output only.")
+    prov_test = provider_sub.add_parser(
+        "test",
+        help="One minimal REAL request per configured provider (LLM, web).",
+    )
+    prov_test.add_argument(
+        "--component",
+        choices=("all", "llm", "web"),
+        default="all",
+        help="Which seam to probe (default: all configured).",
+    )
+    prov_test.add_argument("--json", action="store_true", help="JSON output only.")
+
+    run_cmd = subparsers.add_parser(
+        "real",
+        help="Bounded real-capability runs (start/status/inspect). "
+        "Named `real` because `run` is the core's single-goal command.",
+    )
+    run_sub = run_cmd.add_subparsers(dest="run_command", required=True)
+    run_start = run_sub.add_parser(
+        "start",
+        help="Start one bounded autonomous run through real providers "
+        "(offline adapters only when explicitly requested).",
+    )
+    run_start.add_argument(
+        "--objective",
+        default=(
+            "Research a technical topic using available web sources, compare the "
+            "evidence, identify uncertainties, and produce a concise evidence-backed report."
+        ),
+        help="The bounded research objective (configurable; nothing hard-coded).",
+    )
+    run_start.add_argument(
+        "--query",
+        action="append",
+        default=None,
+        help="Explicit research query (repeatable; skips LLM query proposal).",
+    )
+    run_start.add_argument(
+        "--question",
+        action="append",
+        default=None,
+        help="Question for external AI participants (repeatable).",
+    )
+    run_start.add_argument(
+        "--max-iterations", type=int, default=None, help="Iteration budget override."
+    )
+    run_start.add_argument(
+        "--offline",
+        action="store_true",
+        help="Force local deterministic adapters (never contacts real providers).",
+    )
+    run_start.add_argument("--json", action="store_true", help="JSON output only.")
+    run_sub.add_parser("status", help="List bounded real runs.")
+    run_status_arg = run_sub.add_parser("inspect", help="Inspect one run's full record.")
+    run_status_arg.add_argument("run_id", help="Run id (from run start/status).")
+    real_demo = run_sub.add_parser(
+        "demo",
+        help="One bounded REAL-capability run: provider preflight, full stage "
+        "walk-through, memory retrieval test (uses live web where configured).",
+    )
+    real_demo.add_argument(
+        "--objective", default=None, help="Override the demonstration objective."
+    )
+    real_demo.add_argument(
+        "--query", action="append", default=None, help="Explicit research query."
+    )
+    real_demo.add_argument("--json", action="store_true", help="JSON output only.")
     aut_status.add_argument("--json", action="store_true", help="Print only JSON.")
 
     for name, helptext in (
@@ -422,6 +502,10 @@ async def _run(args: argparse.Namespace) -> int:
         return await _run_improve(args)
     if getattr(args, "command", None) == "autonomous":
         return await _run_autonomous(args)
+    if getattr(args, "command", None) == "provider":
+        return await _run_provider(args)
+    if getattr(args, "command", None) == "real":
+        return await _run_real(args)
     return await _run_goal(args)
 
 
@@ -1455,6 +1539,218 @@ async def _run_autonomous(args: argparse.Namespace) -> int:
         return await run_demo(as_json=args.json)
     print(f"error: unknown autonomous command {command!r}", file=sys.stderr)
     return 1
+
+
+# -- Real capabilities (Phase P9) ------------------------------------------------------
+
+
+def _print_health(status: Any, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(status.model_dump(mode="json"), indent=2))
+        return
+    print(status.summary_line())
+    if not status.ok and status.detail:
+        print(f"    detail: {status.detail}")
+
+
+async def _run_provider(args: argparse.Namespace) -> int:
+    """`skynet provider status|test` — classify or minimally probe providers."""
+    from agency.orchestrator.health import check_llm_provider, check_web_stack
+
+    settings = SkynetSettings(storage_backend="memory", perception_adapter="none")
+    statuses: list[Any]
+    if args.provider_command == "status":
+        # Classification only: no requests are sent in `status`.
+        statuses = []
+        for component, provider, model in (
+            ("llm", settings.llm_provider, settings.llm_model),
+            ("web", settings.search_provider, ""),
+            ("comms", settings.ai_providers, ""),
+        ):
+            if provider == "mock":
+                kind, label = "mock", "MOCK"
+            elif provider == "none":
+                kind, label = "unavailable", "UNAVAILABLE"
+            else:
+                kind, label = "real", "REAL"
+            from agency.orchestrator.health import HealthStatus
+
+            statuses.append(
+                HealthStatus(
+                    component=component,
+                    provider=provider,
+                    kind=kind,  # type: ignore[arg-type]
+                    model=model,
+                    reachable=True,  # configured; liveness not probed here
+                    ok=kind == "mock",
+                    label=label,
+                    detail=(
+                        "classification only — always available offline"
+                        if kind == "mock"
+                        else "configured REAL — run `provider test` to verify liveness"
+                    ),
+                )
+            )
+    else:
+        checks = []
+        if args.component in {"all", "llm"}:
+            checks.append(check_llm_provider(settings))
+        if args.component in {"all", "web"}:
+            checks.append(check_web_stack(settings))
+        statuses = [await c for c in checks]
+
+    # `status` is informational: rc 0 unless something is configured OFF.
+    # `test` reflects real liveness: rc 0 only when every probe passed.
+    if args.provider_command == "status":
+        ok = all(s.kind != "unavailable" for s in statuses)
+    else:
+        ok = all(s.ok for s in statuses)
+    if args.json:
+        print(json.dumps([s.model_dump(mode="json") for s in statuses], indent=2))
+        return 0 if ok else 1
+    for status in statuses:
+        _print_health(status, as_json=False)
+    return 0 if ok else 1
+
+
+async def _run_real(args: argparse.Namespace) -> int:
+    """`skynet run start|status|inspect` — bounded real-capability runs."""
+    from agency.bootstrap import build_orchestrator
+    from agency.orchestrator.demo import OBJECTIVE as DEMO_OBJECTIVE
+
+    settings = SkynetSettings(storage_backend="memory", perception_adapter="none")
+    if getattr(args, "offline", False):
+        settings = settings.model_copy(
+            update={
+                "enable_web_tools": False,
+                "enable_external_comms": False,
+                "web_offline_mode": True,
+            }
+        )
+    else:
+        # Real execution: web/comms seams follow settings (enable_web_tools,
+        # enable_external_comms). Real LLM rides the llm_provider settings.
+        settings = settings.model_copy(
+            update={"enable_web_tools": True, "enable_external_comms": True}
+        )
+
+    if args.run_command == "status":
+        orchestrator = build_orchestrator(settings)
+        runs = await orchestrator._store.list()
+        if args.json:
+            print(
+                json.dumps(
+                    [
+                        {
+                            "id": r.id,
+                            "status": r.status.value,
+                            "stage": r.current_stage.value,
+                            "objective": r.objective,
+                        }
+                        for r in runs
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+        if not runs:
+            print("no runs recorded")
+            return 0
+        for r in runs:
+            print(
+                f"  - {r.id[:12]}  [{r.status.value}]  {r.current_stage.value}  "
+                f"{r.objective[:60]}"
+            )
+        return 0
+
+    if args.run_command == "inspect":
+        orchestrator = build_orchestrator(settings)
+        run = await orchestrator._store.get(args.run_id)
+        if run is None:
+            print(f"error: unknown run id {args.run_id!r}", file=sys.stderr)
+            return 1
+        _print_run(run, as_json=args.json)
+        if not args.json:
+            for e in run.evidence[-10:]:
+                ec = e.provenance.get("evidence_class", "")
+                print(f"    - [{e.source_type}/{ec}] {e.source} ({e.confidence:.2f})")
+        return 0
+
+    if args.run_command == "demo":
+        from agency.orchestrator.real_demo import run_real_demo
+
+        return await run_real_demo(
+            objective=args.objective,
+            queries=list(args.query) if args.query else None,
+            as_json=args.json,
+        )
+
+    # -- start ------------------------------------------------------------------
+    from agency.orchestrator.models import OrchestratorBudgets
+
+    configuration: dict[str, Any] = {}
+    if getattr(args, "query", None):
+        configuration["research_queries"] = list(args.query)
+    if getattr(args, "question", None):
+        configuration["ai_questions"] = list(args.question)
+    budgets = OrchestratorBudgets(
+        max_iterations=(
+            args.max_iterations
+            if args.max_iterations is not None
+            else settings.autonomous_max_iterations
+        ),
+        max_runtime_seconds=settings.autonomous_max_runtime_seconds,
+        max_web_requests=settings.autonomous_max_web_requests,
+        max_ai_requests=settings.autonomous_max_ai_requests,
+        max_experiments=settings.autonomous_max_experiments,
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def emit(event: str, **payload: Any) -> None:
+        events.append((event, payload))
+
+    orchestrator = build_orchestrator(settings, emit=emit)
+    run = await orchestrator.start(
+        args.objective or DEMO_OBJECTIVE, budgets=budgets, configuration=configuration
+    )
+    run = await orchestrator.execute(run.id)
+
+    if args.json:
+        _print_run(run, as_json=True)
+        return 0 if run.status.value in {"completed", "waiting", "paused"} else 1
+
+    print(f"real run {run.id[:12]}  [{run.status.value}]  stage={run.current_stage.value}")
+    print(f"  objective : {run.objective}")
+    budget_line = (
+        f"  budgets   : iterations={budgets.max_iterations}"
+        f" web={budgets.max_web_requests} ai={budgets.max_ai_requests}"
+    )
+    print(budget_line)
+    print(f"  usage     : {run.usage}")
+    stages_seen: list[str] = []
+    for event, payload in events:
+        if event == "AUTONOMOUS_STAGE_STARTED" and payload.get("stage") not in stages_seen:
+            stages_seen.append(payload.get("stage"))
+    print(f"  stages    : {' -> '.join(str(s).upper() for s in stages_seen)}")
+    print(f"  evidence  : {len(run.evidence)} item(s)")
+    for e in run.evidence[-8:]:
+        ec = e.provenance.get("evidence_class", "")
+        print(f"    - [{e.source_type}/{ec}] {e.source} ({e.confidence:.2f})")
+    by_class: dict[str, int] = {}
+    for e in run.evidence:
+        ec = str(e.provenance.get("evidence_class", "UNLABELLED"))
+        by_class[ec] = by_class.get(ec, 0) + 1
+    print(f"  classes   : {by_class}")
+    if run.security_report:
+        print(
+            f"  security  : {run.security_report.get('status')} — "
+            f"{run.security_report.get('total_flags')} flag(s)"
+        )
+    if run.result:
+        print(f"  result    : {run.result}")
+    for error in run.errors[-3:]:
+        print(f"  error     : {error}")
+    return 0 if run.status.value in {"completed", "waiting", "paused"} else 1
 
 
 def main(argv: list[str] | None = None) -> int:

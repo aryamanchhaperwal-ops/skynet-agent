@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -126,6 +127,16 @@ class TraceEventType(StrEnum):
     AUTONOMOUS_RUN_COMPLETED = "AUTONOMOUS_RUN_COMPLETED"
     AUTONOMOUS_RUN_FAILED = "AUTONOMOUS_RUN_FAILED"
     AUTONOMOUS_RUN_CANCELLED = "AUTONOMOUS_RUN_CANCELLED"
+    # -- Real capabilities (Phase P9) ----------------------------------------------
+    # LLM request lifecycle: payloads carry provider/model/latency/usage —
+    # never message bodies or credentials. Emitted around every provider
+    # completion the orchestrator observes.
+    LLM_REQUEST_STARTED = "LLM_REQUEST_STARTED"
+    LLM_REQUEST_COMPLETED = "LLM_REQUEST_COMPLETED"
+    LLM_REQUEST_FAILED = "LLM_REQUEST_FAILED"
+    SOURCE_RETRIEVED = "SOURCE_RETRIEVED"
+    OBSERVATION_RECORDED = "OBSERVATION_RECORDED"
+    AUTONOMOUS_SECURITY_REPORT = "AUTONOMOUS_SECURITY_REPORT"
 
 
 class TraceEvent(BaseModel):
@@ -165,6 +176,21 @@ class MemoryTraceSink(TraceSink):
     @property
     def types(self) -> list[str]:
         return [event.event_type for event in self.events]
+
+
+class CallableTraceSink(TraceSink):
+    """Forwards events to an async ``emit(event_type, **payload)`` callable.
+
+    Bridges feature modules that define their own facade (e.g. the P8/P9
+    orchestrator) onto the core's sink fan-out so every subsystem shares
+    one observable event stream without a second event system.
+    """
+
+    def __init__(self, emit: Any) -> None:
+        self._emit = emit
+
+    async def emit(self, event: TraceEvent) -> None:
+        await self._emit(event.event_type, **event.payload)
 
 
 class DatabaseTraceSink(TraceSink):
