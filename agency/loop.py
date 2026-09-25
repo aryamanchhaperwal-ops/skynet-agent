@@ -133,6 +133,16 @@ class SkynetCore:
 
     # ------------------------------------------------------------------ API
 
+    @property
+    def action_names(self) -> frozenset[str]:
+        """Registered action names (read-only seam for the orchestrator)."""
+        return frozenset(self._actions.names())
+
+    @property
+    def memory_manager(self) -> MemoryManager | None:
+        """The long-term memory manager, if any (read-only seam)."""
+        return self._memory
+
     async def run_goal(self, spec: GoalSpec) -> RunSummary:
         """Run the full agent cycle for one goal. Never raises: failures
         are recorded and reported through the summary."""

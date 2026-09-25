@@ -347,6 +347,59 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Where improvement memories are recorded (sqlite persists).",
     )
     imp_demo.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    # -- Autonomous orchestrator (agency.orchestrator, Phase P8) -------------------
+    autonomous = subparsers.add_parser(
+        "autonomous",
+        help="Start, pause, resume, cancel and inspect resumable autonomous runs "
+        "that coordinate research, AI communication, the agent core, memory "
+        "and self-improvement (offline demo included).",
+    )
+    autonomous_sub = autonomous.add_subparsers(
+        dest="autonomous_command", required=True
+    )
+
+    aut_start = autonomous_sub.add_parser(
+        "start", help="Create and drive a new autonomous run toward an objective."
+    )
+    aut_start.add_argument(
+        "--objective", required=True, help="What the run should achieve."
+    )
+    aut_start.add_argument(
+        "--max-iterations", type=int, default=None,
+        help="Iteration budget (default SKYNET_AUTONOMOUS_MAX_ITERATIONS).",
+    )
+    aut_start.add_argument(
+        "--question", action="append", default=None,
+        help="Question to put to available external AI participants (repeatable).",
+    )
+    aut_start.add_argument(
+        "--steps", default=None,
+        help="Core agent-cycle plan as JSON [{\"type\",\"params\"}] (executed "
+        "each iteration; default: the core planner's own strategy).",
+    )
+    aut_start.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    aut_status = autonomous_sub.add_parser(
+        "status", help="List autonomous runs and their current state."
+    )
+    aut_status.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    for name, helptext in (
+        ("pause", "Pause a running autonomous run (safe to resume later)."),
+        ("resume", "Resume a paused autonomous run."),
+        ("cancel", "Cancel an autonomous run (state is preserved)."),
+        ("inspect", "Show one run's stage, usage, decisions and errors."),
+    ):
+        cmd = autonomous_sub.add_parser(name, help=helptext)
+        cmd.add_argument("run_id", help="Autonomous run id (from autonomous start/status).")
+        cmd.add_argument("--json", action="store_true", help="Print only JSON.")
+
+    autonomous_sub.add_parser(
+        "demo",
+        help="Run the built-in deterministic offline demonstration of the full "
+        "autonomous loop (research → communicate → act → evaluate → complete).",
+    ).add_argument("--json", action="store_true", help="Print only JSON.")
     return parser
 
 
@@ -367,6 +420,8 @@ async def _run(args: argparse.Namespace) -> int:
         return await _run_experiment(args)
     if getattr(args, "command", None) == "improve":
         return await _run_improve(args)
+    if getattr(args, "command", None) == "autonomous":
+        return await _run_autonomous(args)
     return await _run_goal(args)
 
 
@@ -1240,6 +1295,165 @@ async def _run_improve(args: argparse.Namespace) -> int:
             memory_backend=args.memory_backend, as_json=args.json
         )
     print(f"error: unknown improve command {command!r}", file=sys.stderr)
+    return 1
+
+
+def _build_orchestrator() -> Any:
+    """Assemble the autonomous orchestrator (real subsystems, offline adapters)."""
+    from agency.bootstrap import build_orchestrator
+
+    # The orchestrator's DB-free default: memory-storage core, local corpus
+    # research and local-mock comms unless settings enable the real stacks.
+    settings = SkynetSettings(storage_backend="memory", perception_adapter="none")
+    return build_orchestrator(settings)
+
+
+def _print_run(run: Any, as_json: bool) -> None:
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "id": run.id,
+                    "objective": run.objective,
+                    "status": run.status.value,
+                    "stage": run.current_stage.value,
+                    "iteration": run.iteration,
+                    "usage": run.usage,
+                    "evidence": len(run.evidence),
+                    "decisions": [d.action for d in run.decisions],
+                    "result": run.result,
+                    "errors": run.errors,
+                },
+                indent=2,
+            )
+        )
+        return
+    print(f"autonomous run {run.id[:12]}  [{run.status.value}]  stage={run.current_stage.value}")
+    print(f"  objective : {run.objective}")
+    print(
+        f"  progress  : iteration {run.iteration}, {len(run.evidence)} evidence item(s), "
+        f"{len(run.decisions)} decision(s)"
+    )
+    print(f"  usage     : {run.usage}")
+    if run.pending_approval is not None:
+        print(f"  APPROVAL  : {run.pending_approval.what}")
+    if run.result:
+        print(f"  result    : {run.result}")
+    for error in run.errors[-3:]:
+        print(f"  error     : {error}")
+
+
+async def _run_autonomous_start(args: argparse.Namespace) -> int:
+    from agency.orchestrator.models import OrchestratorBudgets
+
+    settings = SkynetSettings()
+    budgets = OrchestratorBudgets(
+        max_iterations=(
+            args.max_iterations
+            if args.max_iterations is not None
+            else settings.autonomous_max_iterations
+        ),
+        max_runtime_seconds=settings.autonomous_max_runtime_seconds,
+        max_web_requests=settings.autonomous_max_web_requests,
+        max_ai_requests=settings.autonomous_max_ai_requests,
+        max_experiments=settings.autonomous_max_experiments,
+    )
+    configuration: dict[str, Any] = {}
+    if args.question:
+        configuration["ai_questions"] = list(args.question)
+    if args.steps:
+        try:
+            steps = json.loads(args.steps)
+        except json.JSONDecodeError as exc:
+            print(f"error: --steps is not valid JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(steps, list):
+            print("error: --steps must be a JSON array", file=sys.stderr)
+            return 2
+        configuration["core_goal_params"] = {"steps": steps}
+
+    orchestrator = _build_orchestrator()
+    run = await orchestrator.start(
+        args.objective, budgets=budgets, configuration=configuration
+    )
+    run = await orchestrator.execute(run.id)
+    _print_run(run, as_json=args.json)
+    return 0 if run.status.value in {"completed", "waiting", "paused"} else 1
+
+
+async def _run_autonomous_status(args: argparse.Namespace) -> int:
+    orchestrator = _build_orchestrator()
+    runs = await orchestrator._store.list()
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": r.id,
+                        "status": r.status.value,
+                        "stage": r.current_stage.value,
+                        "iteration": r.iteration,
+                        "objective": r.objective,
+                    }
+                    for r in runs
+                ],
+                indent=2,
+            )
+        )
+        return 0
+    if not runs:
+        print("no autonomous runs recorded")
+        return 0
+    print(f"autonomous runs: {len(runs)}")
+    for r in runs:
+        print(f"  - {r.id[:12]}  [{r.status.value}]  {r.current_stage.value}  {r.objective[:60]}")
+    return 0
+
+
+async def _run_autonomous_lifecycle(args: argparse.Namespace, command: str) -> int:
+    orchestrator = _build_orchestrator()
+    method = getattr(orchestrator, command)
+    run = await method(args.run_id)
+    if run is None:
+        print(f"error: unknown run id {args.run_id!r}", file=sys.stderr)
+        return 1
+    _print_run(run, as_json=args.json)
+    return 0
+
+
+async def _run_autonomous_inspect(args: argparse.Namespace) -> int:
+    orchestrator = _build_orchestrator()
+    run = await orchestrator._store.get(args.run_id)
+    if run is None:
+        print(f"error: unknown run id {args.run_id!r}", file=sys.stderr)
+        return 1
+    _print_run(run, as_json=args.json)
+    if not args.json:
+        print("  decisions :")
+        for d in run.decisions:
+            print(f"    - {d.action}: {d.reason}")
+        if run.evidence:
+            print("  evidence  :")
+            for e in run.evidence[-8:]:
+                print(f"    - [{e.source_type}] {e.source} ({e.confidence:.2f})")
+    return 0
+
+
+async def _run_autonomous(args: argparse.Namespace) -> int:
+    command = getattr(args, "autonomous_command", None)
+    if command == "start":
+        return await _run_autonomous_start(args)
+    if command == "status":
+        return await _run_autonomous_status(args)
+    if command in {"pause", "resume", "cancel"}:
+        return await _run_autonomous_lifecycle(args, command)
+    if command == "inspect":
+        return await _run_autonomous_inspect(args)
+    if command == "demo":
+        from agency.orchestrator.demo import run_demo
+
+        return await run_demo(as_json=args.json)
+    print(f"error: unknown autonomous command {command!r}", file=sys.stderr)
     return 1
 
 

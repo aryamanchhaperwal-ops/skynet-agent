@@ -269,6 +269,36 @@ class SkynetSettings(BaseSettings):
         "trigger rollback automatically; otherwise only the event is recorded.",
     )
 
+    # -- Autonomous orchestration (agency.orchestrator, Phase P8) ----------------
+    #: The orchestrator coordinates the finished phases through one resumable
+    #: loop; these settings govern its persistence and default budgets. It
+    #: grants itself no permissions: actions still ride the allow-list and
+    #: improvements stay behind the P7 approval gate.
+    autonomous_runs_path: str = Field(
+        default="data/autonomous_runs.jsonl",
+        description="JSONL file where autonomous run state is persisted.",
+    )
+    autonomous_max_iterations: int = Field(
+        default=3, ge=1, le=100,
+        description="Default iteration budget per autonomous run.",
+    )
+    autonomous_max_runtime_seconds: float = Field(
+        default=600.0, ge=1.0, le=86_400.0,
+        description="Default wall-clock budget per autonomous run.",
+    )
+    autonomous_max_web_requests: int = Field(
+        default=10, ge=0, le=1000,
+        description="Default web-request budget per autonomous run.",
+    )
+    autonomous_max_ai_requests: int = Field(
+        default=6, ge=0, le=1000,
+        description="Default external-AI-request budget per autonomous run.",
+    )
+    autonomous_max_experiments: int = Field(
+        default=2, ge=0, le=100,
+        description="Default experiment budget per autonomous run.",
+    )
+
     @property
     def web_blocked_host_set(self) -> frozenset[str]:
         return frozenset(

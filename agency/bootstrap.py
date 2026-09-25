@@ -9,7 +9,10 @@ extending the category registry below — never by editing the loop.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:  # pragma: no cover - annotation-only import
+    from agency.orchestrator.orchestrator import AutonomousOrchestrator
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -424,4 +427,48 @@ def build_core(
         experiences=ExperienceRecorder(experience_sink),
         trace_sinks=trace_sinks,
         memory=memory,
+    )
+
+
+def build_orchestrator(
+    settings: SkynetSettings | None = None,
+    *,
+    core: SkynetCore | None = None,
+    memory: MemoryManager | None = None,
+    improvement_pipeline: ImprovementPipeline | None = None,
+    research_adapter: object | None = None,
+    comms_adapter: object | None = None,
+    emit: object | None = None,
+) -> AutonomousOrchestrator:
+    """Assemble the autonomous orchestrator from settings.
+
+    Reuses ``build_core`` (or the caller's core), the P7 improvement
+    pipeline, and the P4/P5-backed adapters. Pass explicit adapters for
+    tests/demos (local deterministic ones by default offline).
+    """
+    from agency.orchestrator.adapters import (
+        build_comms_adapter,
+        build_research_adapter,
+    )
+    from agency.orchestrator.orchestrator import AutonomousOrchestrator
+    from agency.orchestrator.store import RunStore
+
+    settings = settings or SkynetSettings()
+    core = core or build_core(settings, memory=memory)
+    memory = memory or core.memory_manager
+    pipeline = improvement_pipeline
+    detector = None
+    if pipeline is None and settings.enable_self_improvement:
+        lab = build_lab_stack(settings, memory=memory)
+        pipeline = lab.improvement
+        detector = lab.improvement._detector  # the pipeline's own thresholds
+    return AutonomousOrchestrator(
+        core=core,
+        store=RunStore(settings.autonomous_runs_path),
+        research=research_adapter or build_research_adapter(settings),
+        comms=comms_adapter or build_comms_adapter(settings),
+        memory=memory,
+        detector=detector,
+        pipeline=pipeline,
+        emit=emit,
     )
