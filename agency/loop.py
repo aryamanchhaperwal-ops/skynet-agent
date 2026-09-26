@@ -44,7 +44,8 @@ from agency.goals import Goal, GoalManager, GoalSpec
 from agency.memory import MemoryManager
 from agency.observation import Observation
 from agency.perception import PerceptionAdapter
-from agency.planner import Plan, Planner
+from agency.plan_validation import PlanValidation, validate_plan
+from agency.planner import DeterministicPlanner, Plan, Planner
 from agency.state import AgentState
 from agency.storage import RunRecord, Storage
 from agency.trace import Trace, TraceEventType, TraceSink
@@ -83,6 +84,9 @@ class RunSummary(BaseModel):
     events: int = 0
     result: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
+    #: Verdict of the plan-validation gate for model-derived plans (empty when
+    #: the planner is deterministic and no validation was required).
+    plan_validation: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=_utcnow)
     finished_at: datetime = Field(default_factory=_utcnow)
     #: Full serializable final AgentState (proof of the serialization contract).
@@ -162,6 +166,7 @@ class SkynetCore:
 
         goal: Goal | None = None
         plan: Plan | None = None
+        plan_validation: PlanValidation | None = None
         action_summaries: list[dict[str, Any]] = []
         run_evaluation: Evaluation | None = None
         experience_count = 0
@@ -252,6 +257,15 @@ class SkynetCore:
 
             # PLAN ------------------------------------------------------------
             plan = await self._planner.plan(goal, state)
+            plan, plan_validation = await self._validate_plan(plan, goal, state, tracer)
+            if plan_validation is not None and not plan_validation.valid:
+                # The safe fallback was invalid too: execute nothing and end
+                # the run through the normal failure path (never crash, never
+                # run an unvalidated step).
+                error = (
+                    "plan rejected by validation and no safe fallback available: "
+                    + "; ".join(plan_validation.reasons)
+                )
             await tracer.emit(
                 TraceEventType.PLAN_CREATED, steps=plan.step_types, rationale=plan.rationale
             )
@@ -472,12 +486,78 @@ class SkynetCore:
             events=tracer.event_count,
             result=run_result,
             error=error,
+            plan_validation=(
+                plan_validation.model_dump(mode="json") if plan_validation else {}
+            ),
             started_at=started_at,
             finished_at=finished_at,
             final_state=state.model_dump(mode="json"),
         )
 
     # ------------------------------------------------------------- internals
+
+    async def _validate_plan(
+        self, plan: Plan, goal: Goal, state: AgentState, tracer: Trace
+    ) -> tuple[Plan, PlanValidation | None]:
+        """Gate a plan before execution (model output is untrusted input).
+
+        Deterministic planners pass through untouched. A plan from a planner
+        that declares ``plans_are_untrusted`` (the LLM planner) is validated;
+        on failure the deterministic safe fallback — restricted to the
+        executable action set — is tried exactly once and validated too. A
+        still-invalid fallback is returned as an empty plan plus an invalid
+        verdict, and the caller terminates the run safely.
+        """
+        if not getattr(self._planner, "plans_are_untrusted", False):
+            return plan, None
+
+        allowed = self._settings.action_allowlist
+        registered = frozenset(self._actions.names())
+        executable = allowed & registered if allowed else registered
+
+        validation = validate_plan(
+            plan,
+            allowed_actions=allowed,
+            registered_actions=registered,
+            max_steps=self._settings.max_steps_per_run,
+        )
+        if validation.valid:
+            await tracer.emit(TraceEventType.PLAN_VALIDATED, steps=plan.step_types)
+            return plan, validation
+
+        await tracer.emit(
+            TraceEventType.PLAN_REJECTED,
+            origin="planner",
+            steps=plan.step_types,
+            issues=validation.reasons,
+        )
+        # Bounded retry: one deterministic fallback, validated once.
+        fallback = DeterministicPlanner(default_action="", allowed_actions=executable)
+        candidate = await fallback.plan(goal, state)
+        candidate_validation = validate_plan(
+            candidate,
+            allowed_actions=allowed,
+            registered_actions=registered,
+            max_steps=self._settings.max_steps_per_run,
+        )
+        if not candidate_validation.valid:
+            await tracer.emit(
+                TraceEventType.PLAN_REJECTED,
+                origin="fallback",
+                steps=candidate.step_types,
+                issues=candidate_validation.reasons,
+            )
+            return (
+                Plan(steps=[], rationale="rejected: no valid fallback plan"),
+                candidate_validation,
+            )
+
+        await tracer.emit(
+            TraceEventType.PLAN_FALLBACK,
+            steps=candidate.step_types,
+            rationale=candidate.rationale,
+        )
+        return candidate, candidate_validation
 
     async def _safe_flush(self) -> None:
         """Flush buffered experiences; a broken sink degrades to a log line

@@ -453,6 +453,24 @@ def _build_parser() -> argparse.ArgumentParser:
     run_status_arg = run_sub.add_parser("inspect", help="Inspect one run's full record.")
     run_status_arg.add_argument("run_id", help="Run id (from run start/status).")
     run_status_arg.add_argument("--json", action="store_true", help="Print only JSON.")
+    run_trace = run_sub.add_parser(
+        "trace",
+        help="Read one run's persisted mission trace stream (survives restart).",
+    )
+    run_trace.add_argument("run_id", help="Run id or unique id prefix.")
+    run_trace.add_argument("--json", action="store_true", help="Print the raw JSON.")
+    run_pause = run_sub.add_parser(
+        "pause", help="Cross-process pause of a running real run (state persists)."
+    )
+    run_pause.add_argument("run_id", help="Run id (from real start/status).")
+    run_pause.add_argument("--json", action="store_true", help="Print only JSON.")
+    run_resume = run_sub.add_parser(
+        "resume",
+        help="Resume a paused real run and drive it on from its persisted state "
+        "(it continues; it does not start a new mission).",
+    )
+    run_resume.add_argument("run_id", help="Run id (from real status).")
+    run_resume.add_argument("--json", action="store_true", help="Print only JSON.")
     real_demo = run_sub.add_parser(
         "demo",
         help="One bounded REAL-capability run: provider preflight, full stage "
@@ -1420,6 +1438,12 @@ def _print_run(run: Any, as_json: bool) -> None:
         f"  progress  : iteration {run.iteration}, {len(run.evidence)} evidence item(s), "
         f"{len(run.decisions)} decision(s)"
     )
+    if run.verification:
+        print(
+            f"  verified  : {run.verification.get('status')} "
+            f"({run.verification.get('external_sources', 0)} external, "
+            f"{len(run.verification.get('independent_sources', []))} independent host(s))"
+        )
     print(f"  usage     : {run.usage}")
     if run.pending_approval is not None:
         print(f"  APPROVAL  : {run.pending_approval.what}")
@@ -1615,6 +1639,43 @@ async def _run_provider(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+async def _run_real_trace(args: argparse.Namespace, settings: Any) -> int:
+    """`real trace <run_id>` — read the persisted mission trace stream."""
+    from agency.orchestrator.trace_store import RunTraceStore
+
+    store = RunTraceStore(settings.autonomous_traces_path or None)
+    all_records = await store.read()
+    records = [r for r in all_records if r.run_id.startswith(args.run_id)]
+    if not records:
+        # Allow matching by run-id prefix because run ids are shown truncated.
+        known = sorted({r.run_id for r in all_records})
+        print(
+            f"no trace events for run {args.run_id!r} "
+            f"({len(all_records)} event(s) across {len(known)} run(s))",
+            file=sys.stderr,
+        )
+        return 1
+    if args.json:
+        print(json.dumps([r.model_dump(mode="json") for r in records], indent=2))
+        return 0
+    print(f"trace for run {records[0].run_id[:12]}  ({len(records)} event(s))")
+    for record in records:
+        stamp = record.timestamp.strftime("%H:%M:%S")
+        detail = ""
+        if record.state:
+            detail += f" stage={record.state}"
+        if record.action:
+            detail += f" action={record.action}"
+        if record.provider:
+            detail += f" provider={record.provider}"
+        if record.status:
+            detail += f" status={record.status}"
+        if record.error:
+            detail += f" error={record.error}"
+        print(f"  {stamp} {record.event_type}{detail}")
+    return 0
+
+
 async def _run_real(args: argparse.Namespace) -> int:
     """`skynet run start|status|inspect` — bounded real-capability runs."""
     from agency.bootstrap import build_orchestrator
@@ -1677,6 +1738,33 @@ async def _run_real(args: argparse.Namespace) -> int:
                 ec = e.provenance.get("evidence_class", "")
                 print(f"    - [{e.source_type}/{ec}] {e.source} ({e.confidence:.2f})")
         return 0
+
+    if args.run_command == "trace":
+        return await _run_real_trace(args, settings)
+
+    if args.run_command == "pause":
+        orchestrator = build_orchestrator(settings)
+        run = await orchestrator.pause(args.run_id)
+        if run is None:
+            print(f"error: unknown run id {args.run_id!r}", file=sys.stderr)
+            return 1
+        _print_run(run, as_json=args.json)
+        return 0
+
+    if args.run_command == "resume":
+        orchestrator = build_orchestrator(settings)
+        resumed = await orchestrator.resume(args.run_id)
+        if resumed is None:
+            print(
+                f"error: run {args.run_id!r} is not paused (unknown or terminal)",
+                file=sys.stderr,
+            )
+            return 1
+        # Drive the *existing* run on from its persisted stage/evidence —
+        # a resume continues the mission, it never creates a new one.
+        run = await orchestrator.execute(args.run_id)
+        _print_run(run, as_json=args.json)
+        return 0 if run.status.value in {"completed", "waiting", "paused"} else 1
 
     if args.run_command == "demo":
         from agency.orchestrator.real_demo import run_real_demo

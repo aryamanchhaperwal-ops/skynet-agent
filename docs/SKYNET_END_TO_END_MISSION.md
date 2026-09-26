@@ -219,7 +219,23 @@ gate remains intact.
   mission **continues rather than restarting from zero**.
 
 CLI lifecycle verified: `autonomous pause|resume|cancel|inspect`,
-`real status|inspect`.
+`real status|inspect|trace|pause|resume`.
+
+**Cross-process pause proved live (new in the hardening pass).** A real
+mission was started by one process; a second process paused it mid-flight
+(`real pause <id>`) while it was in `act` with 3 live sources already
+collected; the driving process stopped and persisted `status=paused`. A
+*third* process then ran `real resume <id>`, which drove the **same run id**
+to `completed` with 4 evidence items — proving PAUSE → PERSIST → RELOAD →
+RESUME → COMPLETE without starting a new mission (run count grew by exactly
+one).
+
+This live test exposed and fixed a real defect: a pause applied *during* a
+stage was silently overwritten by the stage's own end-of-stage save (the
+in-memory copy was still `running`). `AutonomousOrchestrator._save` now
+re-reads the persisted status first and refuses to clobber an operator's
+`PAUSED`/`CANCELLED`. Covered by
+`test_save_preserves_cross_process_pause`.
 
 ---
 
@@ -276,14 +292,29 @@ decisions, security report, evaluation, errors, final status.
 
 During execution the same stages emit lifecycle events through the
 `CallableTraceSink` facade (`AUTONOMOUS_RUN_STARTED`, `…_STAGE_STARTED`,
-`OBSERVATION_RECORDED`, `SOURCE_RETRIEVED`, `LLM_REQUEST_*`,
+`OBSERVATION_RECORDED`, `SOURCE_RETRIEVED`, `EVIDENCE_VERIFIED`,
+`PLAN_VALIDATED`/`PLAN_REJECTED`/`PLAN_FALLBACK`, `LLM_REQUEST_*`,
 `AUTONOMOUS_EVALUATION_COMPLETED`, `AUTONOMOUS_MEMORY_UPDATED`,
 `AUTONOMOUS_RUN_COMPLETED`), each carrying the run id and never credentials.
 
-**Secret redaction:** `test_secrets_never_appear_in_trace_or_run` places a
-sentinel `OPENAI_API_KEY` in the environment, runs through the orchestrator,
-and asserts the sentinel appears in neither the emitted events nor the
-serialized run.
+**Persisted trace stream (new in the hardening pass).** Those events are now
+also written to an append-only JSONL stream (`data/autonomous_run_traces.jsonl`,
+`SKYNET_AUTONOMOUS_TRACES_PATH`) by
+`agency/orchestrator/trace_store.py`. Each `TraceRecord` carries `run_id`,
+`event_id`, `timestamp`, `state` (stage), `event_type`, `component`,
+`action`/`provider`, `status`, `error` and a sanitized `metadata` payload. The
+stream is append-only under a lock (safe for concurrent writers), is re-read
+from disk on every access, and therefore **survives process restarts**.
+Inspect it with `real trace <run_id|prefix>` (or `--json`). The live mission
+produced 41 persisted events for its run.
+
+**Secret redaction:** the store drops secret-named keys (`api_key`, `token`,
+`authorization`, …) and masks secret-shaped values (`sk-…`, `ghp_…`,
+`Bearer …`) before writing; a byte scan of the live trace file found no secret
+material. Tests: `test_secrets_never_appear_in_trace_or_run`,
+`test_trace_redaction_masks_keys_and_values`,
+`test_orchestrator_persists_trace_and_never_leaks_secrets`,
+`test_trace_store_survives_reload`, `test_cli_real_trace_reads_persisted_stream`.
 
 ---
 
@@ -291,11 +322,18 @@ serialized run.
 
 - **AI↔AI is mock-only / UNAVAILABLE** — no real external AI provider exists.
 - **Tiny models are unreliable planners** — `llama3.2:1b` returns
-  schema-violating JSON; the deterministic fallback then picks
-  `gods_eye_latest_events`, which is unregistered in memory/web builds, so
-  that core cycle fails (recorded as an error, then replanned). A capable
-  non-thinking model (`qwen2.5-coder:7b`) plans successfully.
-- **Single-source verification** — Wikipedia alone; confidence kept low.
+  schema-violating JSON; even `qwen2.5-coder:7b` returned schema-violating
+  JSON twice during the live launch. Model output is now validated before
+  execution and falls back deterministically (see §16); the earlier failure
+  mode — the fallback naming the unregistered `gods_eye_latest_events` — is
+  fixed by making the fallback action-aware.
+- **Single-source verification in this environment** — the only working web
+  provider is Wikipedia, so every live source shares one host
+  (`en.wikipedia.org`) and the mission is correctly classified
+  `SINGLE_SOURCE`. The multi-source machinery is implemented and unit-tested
+  with two independent hosts, but it is **UNAVAILABLE to corroborate live**
+  here (DuckDuckGo still returns HTTP 202 to scripted clients). One source is
+  never presented as two.
 - **Wikipedia keyword search** returns nothing for keyword-poor,
   punctuation-heavy queries; the architecture's one budget-counted simplified
   retry mitigates this but is not a general fix.
@@ -303,8 +341,6 @@ serialized run.
   as action failures, never bypassed.
 - **`max_cost_usd` has no central price table** — cost stays 0.0 unless a
   provider reports it.
-- **No persisted trace-event stream** — the run record is the durable trace;
-  raw events are in-process. A dedicated trace store is future work.
 - **`improve propose` needs registered strategies** — detection works
   standalone, but a proposal for an unregistered strategy fails loudly.
 
@@ -343,13 +379,94 @@ python -m agency.cli autonomous demo
 # self-improvement analysis (proposal-only, gated)
 python -m agency.cli improve detect --memory-backend sqlite
 python -m agency.cli improve demo
+
+# persisted mission trace (new in the hardening pass)
+python -m agency.cli real trace <run_id>
+python -m agency.cli real trace <run_id> --json
+
+# cross-process pause / resume of a real run (new in the hardening pass)
+python -m agency.cli real start --objective "..." --query "Ollama software" --max-iterations 3 &
+python -m agency.cli real pause <run_id>     # from a second terminal
+python -m agency.cli real resume <run_id>    # continues the same run id
 ```
 
 ---
 
-## 16. Tests
+## 16. Validation gap closures (P10 hardening)
 
-Full suite: **541 passed, 5 skipped** (was 525 + 16 new P10 tests).
+After the first mission report, five gaps were closed without redesigning
+anything. All reuse the existing architecture.
+
+### 16.1 Plan validation (model output is untrusted control input)
+
+`agency/plan_validation.py` sits between planner and executor. A planner that
+declares `plans_are_untrusted` (the LLM planner) has its plan checked for:
+required fields, non-empty step list, step budget (`max_steps_per_run`), action
+allow-list **and** registration membership, and a control-parameter denylist
+(`command`, `shell`, `exec`, `eval`, `subprocess`, `script`, …) that stops a
+model from smuggling an invocation through an action's parameters.
+
+The response to a failure is bounded and never executes anything:
+
+```
+INVALID PLAN → validation failure (trace PLAN_REJECTED)
+  → deterministic safe fallback (trace PLAN_FALLBACK)
+  → validated once (no retry loop)
+  → safe termination if the fallback is also invalid
+```
+
+Deterministic plans are code, not model guesses, and pass through untouched
+(the historical `gods_eye_latest_events` refusal path is intact and still
+tested). Traces: `PLAN_VALIDATED`, `PLAN_REJECTED`, `PLAN_FALLBACK`.
+
+### 16.2 Action-registration / fallback safety
+
+`DeterministicPlanner` accepts an optional `allowed_actions` set (allow-list ∩
+registry, computed in `build_core`). When set, its configured default is
+emitted only if allowed; otherwise a deterministic read-only preference
+(`web_research` → `web_search` → … → `echo`) is substituted and the rationale
+records the substitution — never silent. With no allowed action at all it
+emits an empty plan. The LLM planner's own fallback is built this way, so a
+model-failure fallback can only name a runnable action. The loop's
+`_execute_step` gate remains the last line: an unregistered or non-allow-listed
+action is a failed result, never an execution.
+
+### 16.3 Multi-source verification
+
+`agency/orchestrator/verification.py` classifies the corroboration status of
+the gathered evidence, computed after research (and after communication) and
+stored on the run, emitted as `EVIDENCE_VERIFIED`, and included in the final
+result:
+
+| Status | Meaning |
+| --- | --- |
+| `MULTI_SOURCE_CORROBORATED` | ≥2 independent hosts cover the same topic |
+| `SINGLE_SOURCE` | one independent host; not corroborated |
+| `CONFLICTING` | independent sources share almost no vocabulary — flagged for review |
+| `NO_EXTERNAL_EVIDENCE` | verification unavailable |
+
+Independence is **host diversity** (two pages on one host are one source);
+topic grouping uses the research query. No second source is ever synthesized:
+the live mission is honestly reported `SINGLE_SOURCE` (§14).
+
+### 16.4 Persisted mission trace
+
+See §13. `RunTraceStore` + `real trace` deliver WRITE EVENT → PROCESS RESTART
+→ READ EVENT.
+
+### 16.5 CLI lifecycle completion
+
+`real pause <run_id>` and `real resume <run_id>` were added (there were no
+equivalent commands for real runs; `autonomous resume` only flips the status).
+`real resume` **drives the existing run on** from its persisted stage and
+evidence — it never creates a new mission.
+
+---
+
+## 17. Tests
+
+Full suite: **567 passed, 5 skipped** (was 525 + the P10/P10-hardening
+additions).
 
 New focused tests (`tests/test_end_to_end_mission.py`):
 
@@ -368,7 +485,7 @@ read `args.json` but never defined the flag, raising `AttributeError`.
 
 ---
 
-## 17. Labels at a glance
+## 18. Labels at a glance
 
 | Capability | Label |
 | --- | --- |
@@ -378,3 +495,8 @@ read `args.json` but never defined the flag, raising `AttributeError`.
 | AI↔AI communication | **MOCK / UNAVAILABLE** (real providers absent) |
 | Self-improvement | **REAL, PROPOSAL-ONLY** (approval-gated, config-only) |
 | Deterministic companion mission | **LOCAL** (`autonomous demo`) |
+| Multi-source verification (live) | **UNAVAILABLE** — one web host reachable; machinery tested with two hosts |
+| Plan validation | **PASS** — model plans gated; deterministic plans honoured |
+| Action registration / fallback safety | **PASS** — fallback cannot name an unrunnable action |
+| Persisted mission trace | **PASS** — append-only, restart-safe, redacted |
+| Cross-process pause/resume | **PASS** — pause holds mid-flight; resume continues the same run |

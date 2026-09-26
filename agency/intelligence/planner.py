@@ -49,6 +49,11 @@ class LLMPlanner(Planner):
 
     name = "llm"
 
+    #: Model output is untrusted control input: the loop re-validates every
+    #: plan this planner returns (including a deterministic fallback plan)
+    #: before executing a single step.
+    plans_are_untrusted = True
+
     def __init__(
         self,
         service: IntelligenceService,

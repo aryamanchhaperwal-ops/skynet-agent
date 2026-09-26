@@ -48,6 +48,7 @@ from agency.orchestrator.models import (
 )
 from agency.orchestrator.state_machine import InvalidTransitionError, require_transition
 from agency.orchestrator.store import RunStore
+from agency.orchestrator.verification import verify_evidence
 
 logger = logging.getLogger("skynet.orchestrator")
 
@@ -110,6 +111,7 @@ class AutonomousOrchestrator:
         detector: Any = None,
         pipeline: Any = None,
         emit: Any = None,
+        trace_store: Any = None,
     ) -> None:
         self._core = core
         self._store = store
@@ -119,10 +121,23 @@ class AutonomousOrchestrator:
         self._detector = detector
         self._pipeline = pipeline
         self._emit = emit
+        #: Optional persisted trace stream (``orchestrator.trace_store``).
+        self._trace_store = trace_store
 
     # -- infrastructure ------------------------------------------------------------
 
     async def _trace(self, event: str, **payload: Any) -> None:
+        """Record one event on the persisted stream and the live emit hook.
+
+        The persisted stream is written first and independently of the emit
+        hook, so a mission's trace survives process restarts even when no
+        live subscriber is attached. Payloads are redacted by the store.
+        """
+        if self._trace_store is not None:
+            try:
+                await self._trace_store.append(event, payload)
+            except Exception:
+                logger.exception("orchestrator trace persistence failed for %s", event)
         if self._emit is None:
             return
         try:
@@ -131,7 +146,24 @@ class AutonomousOrchestrator:
             logger.exception("orchestrator trace emission failed for %s", event)
 
     async def _save(self, run: AutonomousRun) -> None:
+        """Persist the run, never clobbering an operator's pause/cancel.
+
+        Pause and cancel are *cross-process* operations: an operator in a
+        second terminal must be able to stop a run this process is driving.
+        Each stage handler persists its own in-memory copy at stage end, so
+        without this check a pause that landed mid-stage would be silently
+        overwritten (the run would keep going). A PAUSED/CANCELLED status
+        already on disk therefore wins over a RUNNING local copy; every
+        other status transition is written normally.
+        """
         run.touch()
+        current = await self._store.get(run.id)
+        if (
+            current is not None
+            and run.status is RunStatus.RUNNING
+            and current.status in (RunStatus.PAUSED, RunStatus.CANCELLED)
+        ):
+            run.status = current.status
         await self._store.save(run)
 
     def _collect_security_report(self, run: AutonomousRun) -> None:
@@ -620,6 +652,7 @@ class AutonomousOrchestrator:
             queries=len(queries),
             evidence=gathered,
         )
+        await self._verify_evidence(run)
         self._collect_security_report(run)
         if run.plan.ai_questions and run.budgets.max_ai_requests > 0:
             return RunStage.COMMUNICATE
@@ -639,6 +672,7 @@ class AutonomousOrchestrator:
                 run.evidence.append(answer)
                 asked += 1
         self._collect_security_report(run)
+        await self._verify_evidence(run)
         await self._trace(
             "AUTONOMOUS_COMMUNICATION_COMPLETED",
             run_id=run.id,
@@ -646,6 +680,24 @@ class AutonomousOrchestrator:
             answered=asked,
         )
         return RunStage.ACT
+
+    async def _verify_evidence(self, run: AutonomousRun) -> None:
+        """Record the corroboration verdict of the evidence gathered so far.
+
+        Verification is a *classification of retrieved sources* — never a
+        synthesized second source. The verdict is stored on the run, emitted
+        as a trace event, and included in the final result so a single-source
+        mission is honestly reported as single-source.
+        """
+        verdict = verify_evidence(run.evidence)
+        run.verification = verdict
+        await self._trace(
+            "EVIDENCE_VERIFIED",
+            run_id=run.id,
+            status=verdict["status"],
+            external_sources=verdict["external_sources"],
+            independent_sources=verdict["independent_sources"],
+        )
 
     async def _stage_act(self, run: AutonomousRun) -> Any:
         """Execute the full agent cycle through the existing SkynetCore.
@@ -895,6 +947,8 @@ class AutonomousOrchestrator:
             "evidence_count": len(run.evidence),
             "decisions": [d.action for d in run.decisions],
             "core_runs": len(run.core_run_ids),
+            "verification": run.verification,
+            "security_report": run.security_report,
         }
         await self._save(run)
         await self._trace(

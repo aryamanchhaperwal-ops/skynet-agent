@@ -278,6 +278,11 @@ class SkynetSettings(BaseSettings):
         default="data/autonomous_runs.jsonl",
         description="JSONL file where autonomous run state is persisted.",
     )
+    autonomous_traces_path: str = Field(
+        default="data/autonomous_run_traces.jsonl",
+        description="Append-only JSONL stream of autonomous mission trace events "
+        "(restart-safe, secret-redacted). Empty string disables the stream.",
+    )
     autonomous_max_iterations: int = Field(
         default=3, ge=1, le=100,
         description="Default iteration budget per autonomous run.",

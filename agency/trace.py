@@ -33,6 +33,14 @@ class TraceEventType(StrEnum):
     GOAL_CREATED = "GOAL_CREATED"
     OBSERVATION_RECEIVED = "OBSERVATION_RECEIVED"
     PLAN_CREATED = "PLAN_CREATED"
+    # -- Plan validation (model-derived plans are untrusted control input) ----
+    # A planner that reports ``plans_are_untrusted`` has its plan checked by
+    # ``agency.plan_validation`` before any step executes: a rejected plan is
+    # recorded here, replaced by a deterministic safe fallback, and the run
+    # terminates safely if even the fallback is invalid.
+    PLAN_VALIDATED = "PLAN_VALIDATED"
+    PLAN_REJECTED = "PLAN_REJECTED"
+    PLAN_FALLBACK = "PLAN_FALLBACK"
     ACTION_SELECTED = "ACTION_SELECTED"
     ACTION_STARTED = "ACTION_STARTED"
     ACTION_COMPLETED = "ACTION_COMPLETED"
@@ -137,6 +145,10 @@ class TraceEventType(StrEnum):
     SOURCE_RETRIEVED = "SOURCE_RETRIEVED"
     OBSERVATION_RECORDED = "OBSERVATION_RECORDED"
     AUTONOMOUS_SECURITY_REPORT = "AUTONOMOUS_SECURITY_REPORT"
+    #: Evidence corroboration verdict computed after research (single-source
+    #: vs multi-source vs conflicting vs unavailable) — a data classification
+    #: of retrieved sources, never a fabricated second source.
+    EVIDENCE_VERIFIED = "EVIDENCE_VERIFIED"
 
 
 class TraceEvent(BaseModel):

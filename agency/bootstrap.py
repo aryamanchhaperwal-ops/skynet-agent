@@ -390,25 +390,29 @@ def build_core(
             # core working (LLM failure must not destroy the core).
             service = None
     if planner is None:
-        deterministic_planner = DeterministicPlanner()
+        # The actions this assembly may actually execute: the intersection of
+        # the configured allow-list (execution gate, loop._execute_step) and
+        # the actions registered here. An empty configuration means "allow
+        # all registered actions". Used *only* for the LLM path: its fallback
+        # planner must never name an unrunnable action.
+        executable_actions = (
+            settings.action_allowlist & frozenset(registry.names())
+            if settings.action_allowlist
+            else frozenset(registry.names())
+        )
         planner = (
             LLMPlanner(
                 service,  # type: ignore[arg-type] - guarded by use_llm_planner
-                fallback=deterministic_planner,
-                # The planner must propose only actions the run may actually
-                # execute: the intersection of the configured allowlist
-                # (execution gate, loop._execute_step) and the actions
-                # actually registered for this assembly. An empty
-                # configuration means "allow all registered actions".
-                allowed_actions=(
-                    settings.action_allowlist & frozenset(registry.names())
-                    if settings.action_allowlist
-                    else frozenset(registry.names())
-                ),
+                # Model-failure fallback is action-aware: it can only emit a
+                # registered, allowed default. The deterministic-only path
+                # below keeps the historical unfiltered default (its refusal
+                # path is a documented, tested guarantee).
+                fallback=DeterministicPlanner(allowed_actions=executable_actions),
+                allowed_actions=executable_actions,
                 max_steps=settings.max_steps_per_run,
             )
             if service is not None
-            else deterministic_planner
+            else DeterministicPlanner()
         )
     if evaluator is None:
         evaluator = (
@@ -461,6 +465,7 @@ def build_orchestrator(
     research_adapter: object | None = None,
     comms_adapter: object | None = None,
     emit: object | None = None,
+    trace_store: object | None = None,
 ) -> AutonomousOrchestrator:
     """Assemble the autonomous orchestrator from settings.
 
@@ -474,6 +479,7 @@ def build_orchestrator(
     )
     from agency.orchestrator.orchestrator import AutonomousOrchestrator
     from agency.orchestrator.store import RunStore
+    from agency.orchestrator.trace_store import RunTraceStore
 
     settings = settings or SkynetSettings()
     core = core or build_core(settings, memory=memory, emit=emit)
@@ -484,6 +490,8 @@ def build_orchestrator(
         lab = build_lab_stack(settings, memory=memory)
         pipeline = lab.improvement
         detector = lab.improvement._detector  # the pipeline's own thresholds
+    if trace_store is None and settings.autonomous_traces_path:
+        trace_store = RunTraceStore(settings.autonomous_traces_path)
     return AutonomousOrchestrator(
         core=core,
         store=RunStore(settings.autonomous_runs_path),
@@ -493,4 +501,5 @@ def build_orchestrator(
         detector=detector,
         pipeline=pipeline,
         emit=emit,
+        trace_store=trace_store,
     )

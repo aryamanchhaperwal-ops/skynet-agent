@@ -213,6 +213,10 @@ class AutonomousRun(BaseModel):
     #: responses) before they influenced the run. Directive-like fragments
     #: are recorded here as DATA — never executed, never acted upon.
     security_report: dict[str, Any] = Field(default_factory=dict)
+    #: Evidence corroboration verdict (see ``orchestrator.verification``):
+    #: single-source / multi-source / conflicting / unavailable. Computed
+    #: from retrieved sources only — a second source is never fabricated.
+    verification: dict[str, Any] = Field(default_factory=dict)
     budgets: OrchestratorBudgets = Field(default_factory=OrchestratorBudgets)
     #: Actual usage counters the budgets check.
     usage: dict[str, float] = Field(
