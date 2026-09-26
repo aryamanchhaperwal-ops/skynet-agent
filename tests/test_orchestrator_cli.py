@@ -140,6 +140,36 @@ def test_cli_pause_active_run_then_resume(
     asyncio_run_isolated(scenario())
 
 
+def test_cli_real_status_and_inspect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`real status` / `real inspect` are valid lifecycle commands (P10).
+
+    Regression: both subcommands read ``args.json`` but historically did
+    not define it, raising AttributeError instead of reporting the run.
+    """
+    monkeypatch.setenv(
+        "SKYNET_AUTONOMOUS_RUNS_PATH", str(tmp_path / "real-runs.jsonl")
+    )
+    # A run is created offline (no network); its terminal status is not the
+    # point — that the lifecycle commands can read it back is.
+    cli.main(["real", "start", "--objective", "real cli target", "--offline", "--json"])
+    started = json.loads(capsys.readouterr().out)
+    run_id = started["id"]
+
+    rc = cli.main(["real", "status", "--json"])
+    assert rc == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert any(r["id"] == run_id for r in listed)
+
+    rc = cli.main(["real", "inspect", run_id, "--json"])
+    assert rc == 0
+    inspected = json.loads(capsys.readouterr().out)
+    assert inspected["id"] == run_id
+    assert inspected["objective"] == "real cli target"
+
+
 def test_cli_demo(
     tmp_runs_path: Any, capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,

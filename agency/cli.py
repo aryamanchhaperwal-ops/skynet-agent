@@ -448,9 +448,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force local deterministic adapters (never contacts real providers).",
     )
     run_start.add_argument("--json", action="store_true", help="JSON output only.")
-    run_sub.add_parser("status", help="List bounded real runs.")
+    run_status = run_sub.add_parser("status", help="List bounded real runs.")
+    run_status.add_argument("--json", action="store_true", help="Print only JSON.")
     run_status_arg = run_sub.add_parser("inspect", help="Inspect one run's full record.")
     run_status_arg.add_argument("run_id", help="Run id (from run start/status).")
+    run_status_arg.add_argument("--json", action="store_true", help="Print only JSON.")
     real_demo = run_sub.add_parser(
         "demo",
         help="One bounded REAL-capability run: provider preflight, full stage "

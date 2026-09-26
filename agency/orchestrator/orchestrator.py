@@ -163,6 +163,38 @@ class AutonomousOrchestrator:
             ) + found
             run.security_report["status"] = "CONTENT_TREATED_AS_UNTRUSTED_DATA"
 
+    def _llm_counters(self) -> tuple[int, int]:
+        """(call count, total tokens) observed on the core intelligence service.
+
+        The orchestrator owns no provider: it reads the existing service's
+        recorded calls and accounts the delta it caused. Providers that do
+        not report usage contribute 0 tokens (never a guessed number).
+        """
+        service = getattr(self._core, "_intelligence", None)
+        calls = getattr(service, "calls", None) if service is not None else None
+        if not calls:
+            return (0, 0)
+        tokens = 0
+        for response in calls:
+            usage = getattr(response, "usage", None) or {}
+            tokens += int(usage.get("total_tokens") or 0)
+        return (len(calls), tokens)
+
+    def _account_llm_usage(self, run: AutonomousRun, before: tuple[int, int]) -> None:
+        """Add the post-call LLM delta to the run's usage counters.
+
+        Deltas (never absolutes) keep accounting correct across a resumed
+        run: a fresh orchestrator process starts with an empty call list,
+        so each process accounts only the calls it actually made.
+        """
+        after = self._llm_counters()
+        run.usage["llm_calls"] = run.usage.get("llm_calls", 0.0) + max(
+            0, after[0] - before[0]
+        )
+        run.usage["tokens"] = run.usage.get("tokens", 0.0) + max(
+            0, after[1] - before[1]
+        )
+
     async def _trace_llm_request(
         self,
         run: AutonomousRun,
@@ -186,6 +218,7 @@ class AutonomousOrchestrator:
             model=info.get("model", ""),
         )
         started = time.perf_counter()
+        before = self._llm_counters()
         try:
             result = await coro
         except Exception as exc:
@@ -197,6 +230,7 @@ class AutonomousOrchestrator:
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
             raise
+        self._account_llm_usage(run, before)
         usage = run.usage
         usage["ai_requests"] = usage.get("ai_requests", 0.0) + 1
         await self._trace(
@@ -220,6 +254,8 @@ class AutonomousOrchestrator:
             ai_requests=int(usage.get("ai_requests", 0.0)),
             experiments=int(usage.get("experiments", 0.0)),
             cost_usd=usage.get("cost_usd", 0.0),
+            llm_calls=int(usage.get("llm_calls", 0.0)),
+            tokens=int(usage.get("tokens", 0.0)),
         )
 
     # -- public API ---------------------------------------------------------------------
@@ -636,7 +672,12 @@ class AutonomousOrchestrator:
             origin="self",
             params=params,
         )
+        # Account the core cycle's own LLM calls (planner/evaluator/synthesis)
+        # against the run's LLM/token budget. Deltas only: a resumed run's
+        # fresh service counts just this process's calls.
+        llm_before = self._llm_counters()
         summary = await self._core.run_goal(spec)
+        self._account_llm_usage(run, llm_before)
         run.core_run_ids.append(summary.run_id)
         run.core_summaries.append(
             CoreRunSummary(

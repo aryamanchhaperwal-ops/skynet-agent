@@ -139,15 +139,36 @@ class OrchestratorBudgets(BaseModel):
     max_iterations: int = Field(default=3, ge=1, le=100)
     max_runtime_seconds: float = Field(default=600.0, ge=1.0, le=86_400.0)
     max_web_requests: int = Field(default=10, ge=0, le=1000)
+    #: External AI (AI↔AI) request ceiling — the comms seam.
     max_ai_requests: int = Field(default=6, ge=0, le=1000)
+    #: Provider LLM call ceiling (planning, evaluation, synthesis) — every
+    #: call through the intelligence service, counted by the orchestrator.
+    max_llm_calls: int = Field(default=200, ge=0, le=100_000)
+    #: Optional token ceiling (prompt+completion) when the provider reports
+    #: usage; None disables the check rather than guessing a number.
+    max_tokens: int | None = Field(default=None, ge=0)
     max_experiments: int = Field(default=2, ge=0, le=100)
     #: Optional cost ceiling; adapters that report cost stop above it.
     max_cost_usd: float | None = None
 
-    def check(self, *, iteration: int, runtime_seconds: float, web_requests: int,
-              ai_requests: int, experiments: int, cost_usd: float = 0.0) -> BudgetDecision:
+    def check(
+        self,
+        *,
+        iteration: int,
+        runtime_seconds: float,
+        web_requests: int,
+        ai_requests: int,
+        experiments: int,
+        cost_usd: float = 0.0,
+        llm_calls: int = 0,
+        tokens: int = 0,
+    ) -> BudgetDecision:
         """Return PROCEED/PAUSE/STOP from current usage."""
-        if cost_usd > self.max_cost_usd if self.max_cost_usd is not None else False:
+        if self.max_cost_usd is not None and cost_usd > self.max_cost_usd:
+            return BudgetDecision.PAUSE
+        if self.max_tokens is not None and tokens > self.max_tokens:
+            return BudgetDecision.PAUSE
+        if llm_calls > self.max_llm_calls:
             return BudgetDecision.PAUSE
         if experiments > self.max_experiments:
             return BudgetDecision.PAUSE
@@ -200,6 +221,8 @@ class AutonomousRun(BaseModel):
             "runtime_seconds": 0.0,
             "web_requests": 0.0,
             "ai_requests": 0.0,
+            "llm_calls": 0.0,
+            "tokens": 0.0,
             "experiments": 0.0,
             "cost_usd": 0.0,
         }
