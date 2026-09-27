@@ -1,0 +1,6 @@
+[build]
+builder = "NIXPACKS"
+buildCommand = "pip install ."
+
+[deploy]
+startCommand = "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
