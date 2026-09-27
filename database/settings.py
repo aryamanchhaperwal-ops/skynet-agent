@@ -20,7 +20,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT: Path = Path(__file__).resolve().parents[1]
 ENV_FILE: Path = REPO_ROOT / ".env"
 
-DEFAULT_DATABASE_URL = "postgresql+asyncpg://skynet:skynet_local_dev@localhost:5433/skynet"
+import os
+
+DEFAULT_DATABASE_URL = os.environ.get(
+    "DATABASE_URL", 
+    "postgresql+asyncpg://skynet:skynet_local_dev@localhost:5433/skynet"
+)
 
 
 class DatabaseSettings(BaseSettings):
